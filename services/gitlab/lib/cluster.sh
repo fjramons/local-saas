@@ -97,6 +97,85 @@ _saas_gitlab_cluster_patch_coredns() {
     kubectl -n kube-system rollout status deployment coredns --timeout=60s >/dev/null
 }
 
+# _saas_gitlab_cluster_patch_coredns_pages_wildcard DOMAIN ENABLED
+# --cluster-mode kind only, called only when --pages-url-mode subdomain is active. The CoreDNS
+# 'hosts' plugin used by _saas_gitlab_cluster_patch_coredns can only match exact names, it has no
+# wildcard support at all, so GitLab Pages' per-namespace subdomains (<namespace>.pages.<domain>,
+# unknown at install time, a new one can appear at any point) need CoreDNS's 'template' plugin
+# instead, matching any single-level '<label>.pages.<domain>' name and answering with an A record
+# for the same ingress-nginx ClusterIP the 'hosts' block already points every other domain at, so
+# TLS/Host/routing behave exactly as they do from outside.
+#
+# A separate block, delimited by its OWN marker comments, independent of the 'hosts' block's
+# markers: always stripped and reinserted only if ENABLED=true, so toggling --pages-url-mode back
+# to 'path' on a later 'up'/reinstall cleanly removes this block while leaving the 'hosts' block
+# (still needed for the plain 'pages.<domain>' name) untouched. Not touched in --cluster-mode
+# existing: the user is expected to have configured their own wildcard DNS entry outside this repo.
+#
+# The regex/answer block is assembled with plain bash string operations (no sed/awk substitution
+# of content containing backslashes): both tools' 's///' replacement text special-cases backslash
+# sequences in ways that differ across implementations, which would silently mangle the regex.
+_saas_gitlab_cluster_patch_coredns_pages_wildcard() {
+    local domain="$1" enabled="$2"
+
+    local corefile
+    corefile="$(kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' 2>/dev/null)"
+    if [ -z "$corefile" ]; then
+        _saas_log_warn "Could not read the CoreDNS ConfigMap; *.pages.$domain might not resolve inside the cluster (affects Pages)."
+        return 0
+    fi
+
+    local begin_marker="# saas-gitlab-pages-wildcard-begin" end_marker="# saas-gitlab-pages-wildcard-end"
+    local stripped
+    stripped="$(echo "$corefile" | sed "/^    ${begin_marker}\$/,/^    ${end_marker}\$/d")"
+
+    local new_corefile="$stripped"
+    if [ "$enabled" = "true" ]; then
+        local ingress_ip
+        ingress_ip="$(kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
+        if [ -z "$ingress_ip" ]; then
+            _saas_log_warn "Could not find the ingress-nginx Service; *.pages.$domain might not resolve inside the cluster (affects Pages)."
+            return 0
+        fi
+
+        local escaped_domain="${domain//./\\.}"
+        local regex="^(?P<sub>[a-z0-9]([-a-z0-9]*[a-z0-9])?)\\.pages\\.${escaped_domain}\\.\$"
+        local -a block=(
+            "    ${begin_marker}"
+            "    template IN A pages.${domain} {"
+            "       match \"${regex}\""
+            "       answer \"{{ .Name }} 60 IN A ${ingress_ip}\""
+            "       fallthrough"
+            "    }"
+            "    ${end_marker}"
+        )
+
+        local -a out_lines=() line
+        local inserted=false
+        while IFS= read -r line; do
+            out_lines+=("$line")
+            case "$line" in
+                .:53\ \{*)
+                    if ! $inserted; then
+                        out_lines+=("${block[@]}")
+                        inserted=true
+                    fi
+                    ;;
+            esac
+        done <<< "$stripped"
+        new_corefile="$(printf '%s\n' "${out_lines[@]}")"
+    fi
+
+    local tmp
+    tmp="$(mktemp)"
+    printf '%s\n' "$new_corefile" > "$tmp"
+    kubectl -n kube-system create configmap coredns --from-file=Corefile="$tmp" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    rm -f "$tmp"
+    kubectl -n kube-system rollout restart deployment coredns >/dev/null
+    kubectl -n kube-system rollout status deployment coredns --timeout=60s >/dev/null
+}
+
 # _saas_gitlab_resolve_storage_class [EXPLICIT] NON_INTERACTIVE
 # Resolves the StorageClass to use in --cluster-mode existing. Never fails over a resolvable ambiguity in non-interactive mode ("sensible defaults even without interactivity"); only fails if the cluster has no StorageClass at all.
 _saas_gitlab_resolve_storage_class() {

@@ -123,10 +123,24 @@ EOF
 # (e.g. registry.<domain>, pages.<domain>) are added as extra dnsNames on the SAME certificate,
 # deliberately not a separate certificate or a wildcard, so runner.sh's existing certsSecretName
 # mechanism keeps trusting the one CA/leaf pair without any change.
+# That note is about the MAIN certificate specifically. A second, independent call to this same
+# function with a wildcard DOMAIN (e.g. "*.pages.<domain>") is a legitimate, separate use: install.sh
+# does exactly that for --pages-url-mode subdomain, issuing a standalone Certificate/Secret so the
+# main certificate never needs a wildcard SAN (and the DNS-01 requirement that comes with one).
 _saas_gitlab_certificate_request() {
     local ns="$1" name="$2" domain="$3" issuer="$4" secret_name="$5"
     shift 5
     local -a dns_names=("$domain" "$@")
+
+    # Each name is quoted in the YAML flow sequence below: a leading '*' (a wildcard DOMAIN, e.g.
+    # "*.pages.<domain>") is YAML's alias indicator when unquoted, which used to break parsing with
+    # "did not find expected alphabetic or numeric character" the moment --pages-url-mode subdomain
+    # started passing one here. Quoting is a no-op for a plain hostname, so this is safe either way.
+    local dns_names_yaml="" d
+    for d in "${dns_names[@]}"; do
+        dns_names_yaml+="\"${d}\","
+    done
+    dns_names_yaml="${dns_names_yaml%,}"
 
     kubectl -n "$ns" apply -f - <<EOF || return 1
 apiVersion: cert-manager.io/v1
@@ -135,7 +149,7 @@ metadata:
   name: ${name}
 spec:
   secretName: ${secret_name}
-  dnsNames: [$(IFS=,; echo "${dns_names[*]}")]
+  dnsNames: [${dns_names_yaml}]
   issuerRef: {name: ${issuer}, kind: ClusterIssuer}
 EOF
 

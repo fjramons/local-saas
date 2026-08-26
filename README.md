@@ -78,7 +78,23 @@ saas gitlab install --no-registry            # Container Registry is on by defau
 saas gitlab install --pages                  # GitLab Pages is off by default
 ```
 
-Both work in `--mode dev` and `--mode prod`, and share the same TLS certificate as the main domain (`registry.<domain>` / `pages.<domain>` as extra SANs, no wildcard cert needed). Pages uses path-based project URLs (`pages.<domain>/group/project/`, not `group.pages.<domain>`) precisely so it keeps working with self-signed/HTTP-01 TLS too, instead of requiring a wildcard certificate, which only DNS-01 challenges can obtain.
+Both work in `--mode dev` and `--mode prod`, and share the same TLS certificate as the main domain (`registry.<domain>` / `pages.<domain>` as extra SANs, no wildcard cert needed). Pages defaults to path-based project URLs (`pages.<domain>/group/project/`, not `group.pages.<domain>`) precisely so it keeps working with self-signed/HTTP-01 TLS too, instead of requiring a wildcard certificate, which only DNS-01 challenges can obtain.
+
+An optional `--pages-url-mode subdomain` switches Pages to its native per-namespace URLs (`group.pages.<domain>/project`) instead. It needs a wildcard `*.pages.<domain>` certificate, which is only possible with `--tls self-signed` (signed locally, no external validation involved) or `--tls letsencrypt --challenge dns01` (the only ACME challenge that can prove ownership of a wildcard name). It's a second, standalone certificate/Secret, kept separate from the main one, so the main domain's TLS stays unaffected either way:
+
+```bash
+# Local kind cluster, no DNS provider account needed at all: self-signed doesn't need to prove
+# domain ownership, and '127.0.0.1.nip.io' resolves any subdomain to the host's own address for
+# free, so *.pages.127.0.0.1.nip.io works straight out of the box in a browser.
+saas gitlab install --pages --pages-url-mode subdomain --domain 127.0.0.1.nip.io
+
+# Real public domain, trusted certificate:
+saas gitlab install --pages --pages-url-mode subdomain --tls letsencrypt --challenge dns01 \
+    --dns-provider cloudflare --domain gitlab.mycompany.com --dns-token "$CF_TOKEN" \
+    --email me@mycompany.com
+```
+
+Switching `--pages-url-mode` on an existing release changes the public URL shape of every already-published Pages site (GitLab doesn't redirect between the two), so it's best decided upfront rather than flipped later.
 
 ### High availability (`--mode prod`)
 

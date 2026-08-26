@@ -7,6 +7,16 @@ _saas_gitlab_valid_bool()   { [[ "$1" == "true" || "$1" == "false" ]]; }
 _saas_gitlab_valid_hostport() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 _saas_gitlab_valid_workers()  { [[ "$1" =~ ^[0-9]+$ ]]; }
 _saas_gitlab_valid_nonempty() { [ -n "$1" ]; }
+_saas_gitlab_valid_pages_url_mode() { [[ "$1" == "path" || "$1" == "subdomain" ]]; }
+
+# _saas_gitlab_valid_pages_subdomain_tls PAGES_URL_MODE TLS CHALLENGE
+# A wildcard *.pages.<domain> certificate needs no external validation at all with
+# --tls self-signed (the ClusterIssuer signs it locally, no CA involved), but with
+# --tls letsencrypt it can only be obtained via --challenge dns01 (ACME wildcard rule).
+_saas_gitlab_valid_pages_subdomain_tls() {
+    local pages_url_mode="$1" tls="$2" challenge="$3"
+    [ "$pages_url_mode" != "subdomain" ] || [ "$tls" = "self-signed" ] || [ "$challenge" = "dns01" ]
+}
 
 _saas_gitlab_install_help() {
     cat <<'EOF'
@@ -83,6 +93,19 @@ Options:
                                 subdomain, path-based project URLs so
                                 it works with any TLS challenge type)
       --no-pages                   Disable GitLab Pages (default)
+      --pages-url-mode MODE       path (default) or subdomain, only with
+                                --pages. 'subdomain' gives Pages its
+                                native per-namespace URLs
+                                (<namespace>.pages.<domain>/<project>)
+                                instead of path-based ones
+                                (pages.<domain>/<group>/<project>/), at
+                                the cost of needing a wildcard
+                                *.pages.<domain> certificate: only
+                                possible with --tls self-signed (signs
+                                it locally, no external validation) or
+                                --tls letsencrypt --challenge dns01 (the
+                                only ACME challenge that can prove
+                                ownership of a wildcard name)
   -y, --yes                      Don't ask anything; use the default
                                 values without confirmation
       --non-interactive          Same as --yes for the fill-in prompts
@@ -130,7 +153,7 @@ _saas_gitlab_install() {
     local mode="dev" version="latest" domain="" tls="" force_self_signed_prod=false
     local challenge="" dns_provider="cloudflare" dns_token="" email=""
     local ingress_class="nginx" ssh_host_port="2222" runner_enabled=true
-    local registry_enabled=true pages_enabled=false
+    local registry_enabled=true pages_enabled=false pages_url_mode="path"
     local yes=false non_interactive=false
 
     local release_set=false namespace_set=false cluster_mode_set=false kind_name_set=false
@@ -138,9 +161,10 @@ _saas_gitlab_install() {
     local mode_set=false version_set=false domain_set=false tls_set=false
     local challenge_set=false dns_provider_set=false ingress_class_set=false
     local ssh_host_port_set=false runner_set=false registry_set=false pages_set=false
+    local pages_url_mode_set=false
 
     local args
-    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,registry,no-registry,pages,no-pages,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
+    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,registry,no-registry,pages,no-pages,pages-url-mode:,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
         _saas_gitlab_install_help; return 1
     }
     eval set -- "$args"
@@ -170,6 +194,7 @@ _saas_gitlab_install() {
             --no-registry)           registry_enabled=false; registry_set=true; shift ;;
             --pages)                 pages_enabled=true; pages_set=true; shift ;;
             --no-pages)              pages_enabled=false; pages_set=true; shift ;;
+            --pages-url-mode)        pages_url_mode="$2"; pages_url_mode_set=true; shift 2 ;;
             -y|--yes)                yes=true; shift ;;
             --non-interactive)       non_interactive=true; shift ;;
             -h|--help)               _saas_gitlab_install_help; return 0 ;;
@@ -271,10 +296,42 @@ _saas_gitlab_install() {
         fi
     fi
 
+    # --- Pages enabled? + Pages URL mode (resolved before '--- domain ---' below, so the
+    # domain prompt's suggested default can take the Pages URL mode into account) ---
+    $pages_set || pages_enabled="$(_saas_prompt_bool "Enable GitLab Pages" false "$non_interactive")"
+
+    if [ "$pages_enabled" = "true" ]; then
+        if $pages_url_mode_set; then
+            _saas_gitlab_valid_pages_url_mode "$pages_url_mode" || { _saas_log_err "--pages-url-mode must be 'path' or 'subdomain'."; return 1; }
+        else
+            local -a pages_url_mode_options=("path")
+            { [ "$tls" = "self-signed" ] || [ "$challenge" = "dns01" ]; } && pages_url_mode_options+=("subdomain")
+            pages_url_mode="$(_saas_prompt_menu "GitLab Pages URL mode" "path" "$non_interactive" "${pages_url_mode_options[@]}")"
+        fi
+        _saas_gitlab_valid_pages_subdomain_tls "$pages_url_mode" "$tls" "$challenge" || {
+            _saas_log_err "--pages-url-mode subdomain needs either --tls self-signed (no external validation needed) or --tls letsencrypt --challenge dns01 (a wildcard *.pages.<domain> certificate from a real CA can only be issued via a DNS-01 challenge)."
+            return 1
+        }
+    elif $pages_url_mode_set; then
+        _saas_log_err "--pages-url-mode only applies with --pages."
+        return 1
+    fi
+
     # --- domain ---
     if [ -z "$domain" ]; then
         if [ "$tls" = "self-signed" ]; then
-            domain="$(_saas_prompt "Domain" "${release}.gitlab.local" "$non_interactive")"
+            local domain_default="${release}.gitlab.local"
+            if [ "$pages_enabled" = "true" ] && [ "$pages_url_mode" = "subdomain" ] && [ "$cluster_mode" = "kind" ]; then
+                # A wildcard Pages hostname needs to resolve to this host's own address from
+                # the user's browser too (not just inside the cluster, see
+                # _saas_gitlab_cluster_patch_coredns_pages_wildcard). A '<ip>.nip.io' name
+                # resolves that automatically for any subdomain, with zero setup, since kind
+                # exposes GitLab on 127.0.0.1 via hostPort (cluster.sh). Self-signed only:
+                # nip.io can't help prove domain ownership to a real CA (--tls letsencrypt),
+                # so this default doesn't apply there.
+                domain_default="127.0.0.1.nip.io"
+            fi
+            domain="$(_saas_prompt "Domain" "$domain_default" "$non_interactive")"
         else
             if $non_interactive || [ ! -t 0 ]; then
                 _saas_log_err "--domain is required with --tls letsencrypt (no safe default possible)."
@@ -293,7 +350,6 @@ _saas_gitlab_install() {
     fi
     $runner_set || runner_enabled="$(_saas_prompt_bool "Deploy and register GitLab Runner" true "$non_interactive")"
     $registry_set || registry_enabled="$(_saas_prompt_bool "Enable the Container Registry" true "$non_interactive")"
-    $pages_set || pages_enabled="$(_saas_prompt_bool "Enable GitLab Pages" false "$non_interactive")"
 
     # --- StorageClass (existing cluster only) ---
     if [ "$cluster_mode" = "existing" ]; then
@@ -303,13 +359,13 @@ _saas_gitlab_install() {
     _saas_gitlab_provision "$release" "$namespace" "$cluster_mode" "$kind_name" "$kind_workers" \
         "$storage_mode" "$storage_class" "$mode" "$version" "$domain" "$tls" "$issuer_name" \
         "$challenge" "$dns_provider" "$dns_token" "$email" "$ingress_class" "$ssh_host_port" \
-        "$runner_enabled" "$registry_enabled" "$pages_enabled" "" "" "" "" ""
+        "$runner_enabled" "$registry_enabled" "$pages_enabled" "$pages_url_mode" "" "" "" "" ""
 }
 
 # _saas_gitlab_provision RELEASE NAMESPACE CLUSTER_MODE KIND_NAME KIND_WORKERS \
 #   STORAGE_MODE STORAGE_CLASS MODE VERSION DOMAIN TLS ISSUER_NAME \
 #   CHALLENGE DNS_PROVIDER DNS_TOKEN EMAIL INGRESS_CLASS SSH_HOST_PORT \
-#   RUNNER_ENABLED REGISTRY_ENABLED PAGES_ENABLED \
+#   RUNNER_ENABLED REGISTRY_ENABLED PAGES_ENABLED PAGES_URL_MODE \
 #   PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD ROOT_PASSWORD REDIS_PASSWORD
 #
 # Actually provisions everything (cluster, datastore, TLS, chart, runner, ssh) and persists the state. The last five credential parameters, if empty, are generated here (first install); if non-empty (called from 'up', reusing the saved state), they're reused as-is so as not to break data already persisted on disk.
@@ -330,15 +386,16 @@ _saas_gitlab_issue_letsencrypt_dns01() {
     esac
 }
 
-# _saas_gitlab_render_values_layer SRC DOMAIN RELEASE NAMESPACE INGRESS_CLASS TLS_SECRET
-# Renders one values template (envsubst) into a fresh temp file, printing its path on stdout. Several of these get layered as successive '-f' arguments to 'helm upgrade --install' (see _saas_gitlab_provision): base mode overlay, then optional datastore-ha/registry/pages fragments, in that order, so a later one's keys win over an earlier one's on overlap.
+# _saas_gitlab_render_values_layer SRC DOMAIN RELEASE NAMESPACE INGRESS_CLASS TLS_SECRET [PAGES_NAMESPACE_IN_PATH]
+# Renders one values template (envsubst) into a fresh temp file, printing its path on stdout. Several of these get layered as successive '-f' arguments to 'helm upgrade --install' (see _saas_gitlab_provision): base mode overlay, then optional datastore-ha/registry/pages fragments, in that order, so a later one's keys win over an earlier one's on overlap. PAGES_NAMESPACE_IN_PATH defaults to "true" (its value only matters to the pages.yaml.tpl layer; every other caller/template ignores it).
 _saas_gitlab_render_values_layer() {
-    local src="$1" domain="$2" release="$3" namespace="$4" ingress_class="$5" tls_secret="$6"
+    local src="$1" domain="$2" release="$3" namespace="$4" ingress_class="$5" tls_secret="$6" pages_namespace_in_path="${7:-true}"
     local out
     out="$(mktemp "${TMPDIR:-/tmp}/saas-gitlab-values-XXXXXX.yaml")" || return 1
     SAAS_DOMAIN="$domain" SAAS_RELEASE="$release" SAAS_NAMESPACE="$namespace" \
         SAAS_INGRESS_CLASS="$ingress_class" SAAS_TLS_SECRET="$tls_secret" \
-        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET}' \
+        SAAS_PAGES_NAMESPACE_IN_PATH="$pages_namespace_in_path" \
+        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET} ${SAAS_PAGES_NAMESPACE_IN_PATH}' \
         < "$src" > "$out" || return 1
     echo "$out"
 }
@@ -347,8 +404,8 @@ _saas_gitlab_provision() {
     local release="$1" namespace="$2" cluster_mode="$3" kind_name="$4" kind_workers="$5"
     local storage_mode="$6" storage_class="$7" mode="$8" version="$9" domain="${10}" tls="${11}" issuer_name="${12}"
     local challenge="${13}" dns_provider="${14}" dns_token="${15}" email="${16}" ingress_class="${17}" ssh_host_port="${18}"
-    local runner_enabled="${19}" registry_enabled="${20}" pages_enabled="${21}"
-    local psql_password="${22}" minio_user="${23}" minio_password="${24}" root_password="${25}" redis_password="${26}"
+    local runner_enabled="${19}" registry_enabled="${20}" pages_enabled="${21}" pages_url_mode="${22}"
+    local psql_password="${23}" minio_user="${24}" minio_password="${25}" root_password="${26}" redis_password="${27}"
 
     [ -n "$psql_password" ] || psql_password="$(_saas_random_password 32)"
     [ -n "$minio_user" ]    || minio_user="gitlab-minio"
@@ -367,6 +424,9 @@ _saas_gitlab_provision() {
     [ "$registry_enabled" = "true" ] && extra_sans+=("registry.${domain}")
     [ "$pages_enabled" = "true" ] && extra_sans+=("pages.${domain}")
 
+    local pages_subdomain_wildcard=false
+    [ "$pages_enabled" = "true" ] && [ "$pages_url_mode" = "subdomain" ] && pages_subdomain_wildcard=true
+
     if [ "$cluster_mode" = "kind" ]; then
         if _saas_gitlab_cluster_exists "$kind_name"; then
             _saas_log_info "The kind cluster '$kind_name' already exists, reusing it."
@@ -376,6 +436,7 @@ _saas_gitlab_provision() {
         _saas_gitlab_cluster_use "$kind_name" || return 1
         storage_class=""
         _saas_gitlab_cluster_patch_coredns "$domain" "${extra_sans[@]}"
+        _saas_gitlab_cluster_patch_coredns_pages_wildcard "$domain" "$pages_subdomain_wildcard"
     fi
 
     if [ "$mode" = "prod" ]; then
@@ -405,6 +466,12 @@ _saas_gitlab_provision() {
     local tls_secret="${release}-gitlab-tls"
     _saas_gitlab_certificate_request "$namespace" "${release}-gitlab-cert" "$domain" "$issuer_name" "$tls_secret" "${extra_sans[@]}" || return 1
 
+    local pages_wildcard_tls_secret="${release}-gitlab-pages-wildcard-tls"
+    if [ "$pages_subdomain_wildcard" = "true" ]; then
+        _saas_gitlab_certificate_request "$namespace" "${release}-gitlab-pages-wildcard-cert" \
+            "*.pages.${domain}" "$issuer_name" "$pages_wildcard_tls_secret" || return 1
+    fi
+
     kubectl -n "$namespace" create secret generic "${release}-gitlab-initial-root-password" \
         --from-literal=password="$root_password" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
@@ -428,7 +495,12 @@ _saas_gitlab_provision() {
         rendered_files+=("$layer"); value_files+=(-f "$layer")
     fi
     if [ "$pages_enabled" = "true" ]; then
-        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/pages.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret")" || { rm -f "${rendered_files[@]}"; return 1; }
+        local pages_namespace_in_path="true" pages_tls_secret="$tls_secret"
+        if [ "$pages_subdomain_wildcard" = "true" ]; then
+            pages_namespace_in_path="false"
+            pages_tls_secret="$pages_wildcard_tls_secret"
+        fi
+        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/pages.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$pages_tls_secret" "$pages_namespace_in_path")" || { rm -f "${rendered_files[@]}"; return 1; }
         rendered_files+=("$layer"); value_files+=(-f "$layer")
     fi
 
@@ -459,7 +531,7 @@ _saas_gitlab_provision() {
         "MODE=$mode" "VERSION=$version" "DOMAIN=$domain" "TLS=$tls" "ISSUER_NAME=$issuer_name" \
         "CHALLENGE=$challenge" "DNS_PROVIDER=$dns_provider" "EMAIL=$email" \
         "INGRESS_CLASS=$ingress_class" "SSH_HOST_PORT=$ssh_host_port" "RUNNER_ENABLED=$runner_enabled" \
-        "REGISTRY_ENABLED=$registry_enabled" "PAGES_ENABLED=$pages_enabled" \
+        "REGISTRY_ENABLED=$registry_enabled" "PAGES_ENABLED=$pages_enabled" "PAGES_URL_MODE=$pages_url_mode" \
         "PSQL_PASSWORD=$psql_password" "MINIO_ROOT_USER=$minio_user" "MINIO_ROOT_PASSWORD=$minio_password" \
         "ROOT_PASSWORD=$root_password" "REDIS_PASSWORD=$redis_password" \
         "STATUS=up"
@@ -514,6 +586,7 @@ _saas_gitlab_up() {
         "$SAAS_GITLAB_STATE_ISSUER_NAME" "$SAAS_GITLAB_STATE_CHALLENGE" "$SAAS_GITLAB_STATE_DNS_PROVIDER" "" \
         "$SAAS_GITLAB_STATE_EMAIL" "$SAAS_GITLAB_STATE_INGRESS_CLASS" "$SAAS_GITLAB_STATE_SSH_HOST_PORT" \
         "$SAAS_GITLAB_STATE_RUNNER_ENABLED" "$SAAS_GITLAB_STATE_REGISTRY_ENABLED" "$SAAS_GITLAB_STATE_PAGES_ENABLED" \
+        "${SAAS_GITLAB_STATE_PAGES_URL_MODE:-path}" \
         "$SAAS_GITLAB_STATE_PSQL_PASSWORD" "$SAAS_GITLAB_STATE_MINIO_ROOT_USER" \
         "$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_REDIS_PASSWORD"
 }
@@ -565,6 +638,7 @@ _saas_gitlab_down() {
         "CHALLENGE=$SAAS_GITLAB_STATE_CHALLENGE" "DNS_PROVIDER=$SAAS_GITLAB_STATE_DNS_PROVIDER" "EMAIL=$SAAS_GITLAB_STATE_EMAIL" \
         "INGRESS_CLASS=$SAAS_GITLAB_STATE_INGRESS_CLASS" "SSH_HOST_PORT=$SAAS_GITLAB_STATE_SSH_HOST_PORT" "RUNNER_ENABLED=$SAAS_GITLAB_STATE_RUNNER_ENABLED" \
         "REGISTRY_ENABLED=$SAAS_GITLAB_STATE_REGISTRY_ENABLED" "PAGES_ENABLED=$SAAS_GITLAB_STATE_PAGES_ENABLED" \
+        "PAGES_URL_MODE=${SAAS_GITLAB_STATE_PAGES_URL_MODE:-path}" \
         "PSQL_PASSWORD=$SAAS_GITLAB_STATE_PSQL_PASSWORD" "MINIO_ROOT_USER=$SAAS_GITLAB_STATE_MINIO_ROOT_USER" "MINIO_ROOT_PASSWORD=$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" \
         "ROOT_PASSWORD=$SAAS_GITLAB_STATE_ROOT_PASSWORD" "REDIS_PASSWORD=$SAAS_GITLAB_STATE_REDIS_PASSWORD" \
         "STATUS=down"
@@ -656,6 +730,7 @@ _saas_gitlab_status() {
     echo "Runner:         $SAAS_GITLAB_STATE_RUNNER_ENABLED"
     echo "Registry:       $SAAS_GITLAB_STATE_REGISTRY_ENABLED"
     echo "Pages:          $SAAS_GITLAB_STATE_PAGES_ENABLED"
+    echo "Pages URL mode: ${SAAS_GITLAB_STATE_PAGES_URL_MODE:-path}"
     echo "Saved status:   $SAAS_GITLAB_STATE_STATUS"
 
     if [ "$SAAS_GITLAB_STATE_CLUSTER_MODE" = "kind" ] && ! _saas_gitlab_cluster_exists "$SAAS_GITLAB_STATE_KIND_NAME" 2>/dev/null; then

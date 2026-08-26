@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
         --keep) KEEP=true; shift ;;
         --only) ONLY="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--keep] [--only dev-install|registry|pages|duckdns|up-down|ssh-config|prod-ha]"
+            echo "Usage: $0 [--keep] [--only dev-install|registry|pages|duckdns|up-down|ssh-config|prod-ha|pages-subdomain]"
             exit 0
             ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -268,6 +268,62 @@ if [ "$ONLY" = "prod-ha" ]; then
     }
     prod_ha_phase
     saas gitlab delete "$HA_RELEASE" --purge-storage -y >/dev/null 2>&1
+    trap - EXIT
+fi
+
+# ------------------------------------------------------------------
+# Phase: pages-subdomain, OPT-IN ONLY, never part of the default full-suite run (must be requested
+# explicitly with --only pages-subdomain). A second full GitLab install with its own release/domain,
+# so it doesn't interfere with $RELEASE's own 'pages' phase above (which stays on the default 'path'
+# URL mode). Only exercises the --tls self-signed side of --pages-url-mode subdomain: unlike
+# --tls letsencrypt --challenge dns01, it needs no real DNS provider account at all (a self-signed
+# ClusterIssuer signs a wildcard SAN locally, no CA validation involved), the same reason the
+# 'duckdns' phase above can't attempt real ACME issuance in CI either. The letsencrypt+dns01 path
+# can only be verified manually (see README.md's --pages-url-mode example).
+#
+# '127.0.0.1.nip.io' as --domain resolves any subdomain to the host's own loopback address with zero
+# setup (see CLAUDE.md's "Pages TLS decision"), which is what makes this phase runnable in CI: no
+# DNS to configure, no account, nothing external.
+# ------------------------------------------------------------------
+if [ "$ONLY" = "pages-subdomain" ]; then
+    echo "=== Phase: pages-subdomain (opt-in) ==="
+    SUB_RELEASE="saase2epagessub"
+    # Same 'set -u' guard rationale as the prod-ha phase above: state isn't persisted until a full
+    # install succeeds, so this phase takes over the EXIT trap for its own duration.
+    trap 'saas gitlab delete "$SUB_RELEASE" --purge-storage -y >/dev/null 2>&1' EXIT
+    pages_subdomain_phase() {
+    if saas gitlab install --release "$SUB_RELEASE" --cluster-mode kind --mode dev \
+        --tls self-signed --domain 127.0.0.1.nip.io --kind-workers 0 \
+        --pages --pages-url-mode subdomain --non-interactive -y; then
+        pass "install (self-signed, --pages-url-mode subdomain) succeeds"
+    else
+        fail "install (self-signed, --pages-url-mode subdomain) succeeds"
+    fi
+
+    _saas_gitlab_state_load "$SUB_RELEASE" 2>/dev/null || { fail "pages-subdomain: no saved state after install"; return; }
+    ns="${SAAS_GITLAB_STATE_NAMESPACE:-$SUB_RELEASE}"
+
+    kubectl -n "$ns" get certificate "${SUB_RELEASE}-gitlab-pages-wildcard-cert" \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True \
+        && pass "the wildcard Pages Certificate is Ready" || fail "the wildcard Pages Certificate is Ready"
+
+    kubectl -n "$ns" get secret "${SUB_RELEASE}-gitlab-pages-wildcard-tls" >/dev/null 2>&1 \
+        && pass "the wildcard Pages Secret exists, separate from the main one" \
+        || fail "the wildcard Pages Secret exists, separate from the main one"
+
+    kubectl -n kube-system get configmap coredns -o jsonpath='{.data.Corefile}' 2>/dev/null \
+        | grep -q "saas-gitlab-pages-wildcard-begin" \
+        && pass "the CoreDNS wildcard template block is present" \
+        || fail "the CoreDNS wildcard template block is present"
+
+    status_code="$(_e2e_curl_in_cluster "$ns" "saas-e2e-pages-subdomain-check-$$" "https://somegroup.pages.127.0.0.1.nip.io/")"
+    # Same "any real HTTP response proves it's reachable" logic as the 'pages' phase above: no
+    # project has published a Pages site under this made-up namespace, so a 404 is expected and fine.
+    [[ "$status_code" =~ ^[0-9]{3}$ ]] && pass "a Pages subdomain (somegroup.pages.<domain>) is reachable (HTTP $status_code)" \
+        || fail "a Pages subdomain (somegroup.pages.<domain>) is reachable (HTTP $status_code)"
+    }
+    pages_subdomain_phase
+    saas gitlab delete "$SUB_RELEASE" --purge-storage -y >/dev/null 2>&1
     trap - EXIT
 fi
 
