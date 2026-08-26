@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast unit tests (<1s, no real cluster) for saas gitlab: validators, StorageClass/version resolution, persistent state, ~/.ssh/config snippet generation. Mocks kubectl/helm/kind_cluster by shadowing functions — same pattern as tests/kind-cluster/test-suggest-target.sh in the sibling bash-aliases repo. Does not replace the real E2E suite (tests/gitlab/e2e/).
+# Fast unit tests (<1s, no real cluster) for saas gitlab: validators, StorageClass/version resolution, persistent state, ~/.ssh/config snippet generation. Mocks kubectl/helm/kind_cluster by shadowing functions, same pattern as tests/kind-cluster/test-suggest-target.sh in the sibling bash-aliases repo. Does not replace the real E2E suite (tests/gitlab/e2e/).
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -15,9 +15,11 @@ source "$REPO_ROOT/lib/common.sh"
 source "$REPO_ROOT/services/gitlab/lib/state.sh"
 source "$REPO_ROOT/services/gitlab/lib/cluster.sh"
 source "$REPO_ROOT/services/gitlab/lib/versions.sh"
+source "$REPO_ROOT/services/gitlab/lib/operators.sh"
 source "$REPO_ROOT/services/gitlab/lib/tls.sh"
 source "$REPO_ROOT/services/gitlab/lib/ssh.sh"
 source "$REPO_ROOT/services/gitlab/lib/credentials.sh"
+source "$REPO_ROOT/services/gitlab/lib/install.sh"
 
 export SAAS_GITLAB_STATE_DIR
 SAAS_GITLAB_STATE_DIR="$(mktemp -d)"
@@ -41,12 +43,16 @@ _saas_gitlab_valid_dns_provider "route53" && fail "valid_dns_provider rejects an
 # Persistent state: roundtrip, including values with spaces/quotes
 # ------------------------------------------------------------------
 _saas_gitlab_state_save "unittest" "RELEASE=unittest" "NAMESPACE=unittest" \
-    "DOMAIN=unittest.gitlab.local" "PSQL_PASSWORD=p@ss w/ spaces \"and quotes\"" "STATUS=up"
+    "DOMAIN=unittest.gitlab.local" "PSQL_PASSWORD=p@ss w/ spaces \"and quotes\"" \
+    "REGISTRY_ENABLED=true" "PAGES_ENABLED=false" "REDIS_PASSWORD=redispw123" "STATUS=up"
 
 if _saas_gitlab_state_load "unittest"; then
     [ "$SAAS_GITLAB_STATE_RELEASE" = "unittest" ] && pass "state roundtrip: RELEASE" || fail "state roundtrip: RELEASE (got '$SAAS_GITLAB_STATE_RELEASE')"
     [ "$SAAS_GITLAB_STATE_DOMAIN" = "unittest.gitlab.local" ] && pass "state roundtrip: DOMAIN" || fail "state roundtrip: DOMAIN"
     [ "$SAAS_GITLAB_STATE_PSQL_PASSWORD" = 'p@ss w/ spaces "and quotes"' ] && pass "state roundtrip: value with spaces/quotes" || fail "state roundtrip: value with spaces/quotes (got '$SAAS_GITLAB_STATE_PSQL_PASSWORD')"
+    [ "$SAAS_GITLAB_STATE_REGISTRY_ENABLED" = "true" ] && pass "state roundtrip: REGISTRY_ENABLED" || fail "state roundtrip: REGISTRY_ENABLED"
+    [ "$SAAS_GITLAB_STATE_PAGES_ENABLED" = "false" ] && pass "state roundtrip: PAGES_ENABLED" || fail "state roundtrip: PAGES_ENABLED"
+    [ "$SAAS_GITLAB_STATE_REDIS_PASSWORD" = "redispw123" ] && pass "state roundtrip: REDIS_PASSWORD" || fail "state roundtrip: REDIS_PASSWORD"
 else
     fail "state roundtrip: could not load the just-saved state"
 fi
@@ -55,9 +61,21 @@ _saas_gitlab_state_exists "unittest" && pass "state_exists detects a saved state
 _saas_gitlab_state_exists "does-not-exist" && fail "state_exists doesn't detect a nonexistent state" || pass "state_exists doesn't detect a nonexistent state"
 
 _saas_gitlab_state_save_key "unittest" "STATUS" "down" >/dev/null
+# Unset before reloading: 'source'-ing a state file that OMITS a key leaves any previously-set
+# shell variable of the same name untouched, which would make a broken 'fields' list in state.sh
+# (one missing the new keys) look like it "preserved" them when it actually just silently dropped
+# them from the file: this happened for real while adding REGISTRY_ENABLED/PAGES_ENABLED/
+# REDIS_PASSWORD, and the reload-only assertion below didn't catch it. Cross-check the raw file too.
+unset SAAS_GITLAB_STATE_STATUS SAAS_GITLAB_STATE_DOMAIN SAAS_GITLAB_STATE_REGISTRY_ENABLED SAAS_GITLAB_STATE_PAGES_ENABLED SAAS_GITLAB_STATE_REDIS_PASSWORD
 _saas_gitlab_state_load "unittest"
 [ "$SAAS_GITLAB_STATE_STATUS" = "down" ] && pass "state_save_key updates a single key" || fail "state_save_key updates a single key"
 [ "$SAAS_GITLAB_STATE_DOMAIN" = "unittest.gitlab.local" ] && pass "state_save_key preserves the other keys" || fail "state_save_key preserves the other keys"
+[ "$SAAS_GITLAB_STATE_REGISTRY_ENABLED" = "true" ] && pass "state_save_key preserves REGISTRY_ENABLED" || fail "state_save_key preserves REGISTRY_ENABLED"
+[ "$SAAS_GITLAB_STATE_PAGES_ENABLED" = "false" ] && pass "state_save_key preserves PAGES_ENABLED" || fail "state_save_key preserves PAGES_ENABLED"
+[ "$SAAS_GITLAB_STATE_REDIS_PASSWORD" = "redispw123" ] && pass "state_save_key preserves REDIS_PASSWORD" || fail "state_save_key preserves REDIS_PASSWORD"
+grep -q "^SAAS_GITLAB_STATE_REGISTRY_ENABLED=" "$(_saas_gitlab_state_path unittest)" \
+    && pass "state_save_key: REGISTRY_ENABLED is actually present in the saved file" \
+    || fail "state_save_key: REGISTRY_ENABLED is actually present in the saved file"
 
 _saas_gitlab_state_delete "unittest"
 _saas_gitlab_state_exists "unittest" && fail "state_delete removes the state" || pass "state_delete removes the state"
@@ -126,6 +144,106 @@ echo "$out" | grep -qx "Host sshtest.gitlab.local" && pass "ssh-config: block wi
 echo "$out" | grep -q "Port 2222" && pass "ssh-config: right port" || fail "ssh-config: right port"
 echo "$out" | grep -q "User git" && pass "ssh-config: 'git' user" || fail "ssh-config: 'git' user"
 _saas_gitlab_state_delete "sshtest"
+
+# ------------------------------------------------------------------
+# DNS-01 provider dispatch: _saas_gitlab_issue_letsencrypt_dns01 must call the right issuer function
+# for each provider (replaces the old "duckdns errors out" expectation now that it's implemented).
+# ------------------------------------------------------------------
+_TEST_DNS01_CALLED=""
+_saas_gitlab_certmanager_issuer_letsencrypt_dns01_cloudflare() { _TEST_DNS01_CALLED="cloudflare:$1:$2:$3"; }
+_saas_gitlab_certmanager_issuer_letsencrypt_dns01_duckdns()    { _TEST_DNS01_CALLED="duckdns:$1:$2:$3"; }
+
+_saas_gitlab_issue_letsencrypt_dns01 "myissuer" "me@x.com" "tok1" "cloudflare"
+[ "$_TEST_DNS01_CALLED" = "cloudflare:myissuer:me@x.com:tok1" ] && pass "dns01 dispatch: cloudflare calls the cloudflare issuer" || fail "dns01 dispatch: cloudflare calls the cloudflare issuer (got '$_TEST_DNS01_CALLED')"
+
+_TEST_DNS01_CALLED=""
+_saas_gitlab_issue_letsencrypt_dns01 "myissuer" "me@x.com" "tok2" "duckdns"
+[ "$_TEST_DNS01_CALLED" = "duckdns:myissuer:me@x.com:tok2" ] && pass "dns01 dispatch: duckdns calls the duckdns issuer" || fail "dns01 dispatch: duckdns calls the duckdns issuer (got '$_TEST_DNS01_CALLED')"
+
+_saas_gitlab_issue_letsencrypt_dns01 "myissuer" "me@x.com" "tok3" "route53" >/dev/null 2>&1 \
+    && fail "dns01 dispatch: rejects an unsupported provider" || pass "dns01 dispatch: rejects an unsupported provider"
+unset -f _saas_gitlab_certmanager_issuer_letsencrypt_dns01_cloudflare _saas_gitlab_certmanager_issuer_letsencrypt_dns01_duckdns
+
+# ------------------------------------------------------------------
+# _saas_gitlab_cluster_patch_coredns: variadic + idempotent replace (no duplication on a repeated
+# call with the same domains; old entries replaced, not just appended, when the domain set changes).
+# ------------------------------------------------------------------
+# The Corefile "current state" is kept in a real FILE, not a shell variable: the mocked kubectl call
+# that applies a new Corefile is the left side of a pipe ('kubectl create ... | kubectl apply -f -'),
+# which bash always runs in a subshell. A plain variable assignment there would be lost the moment
+# that subshell exits, but a write to a file survives it.
+_TEST_COREFILE_FILE="$(mktemp)"
+cat > "$_TEST_COREFILE_FILE" <<'EOF'
+.:53 {
+    errors
+    kubernetes cluster.local {
+       fallthrough
+    }
+}
+EOF
+kubectl() {
+    case "$*" in
+        "-n ingress-nginx get svc ingress-nginx-controller -o jsonpath={.spec.clusterIP}") echo "10.0.0.1" ;;
+        "-n kube-system get configmap coredns -o jsonpath={.data.Corefile}") cat "$_TEST_COREFILE_FILE" ;;
+        "-n kube-system create configmap coredns --from-file=Corefile="*)
+            local path="$*"
+            path="${path#*--from-file=Corefile=}"
+            path="${path%% *}"
+            cp "$path" "$_TEST_COREFILE_FILE"
+            ;;
+        "apply -f -") cat >/dev/null ;;
+        "-n kube-system rollout restart deployment coredns") ;;
+        "-n kube-system rollout status deployment coredns --timeout=60s") ;;
+    esac
+}
+
+_saas_gitlab_cluster_patch_coredns "gitlab.local" "registry.gitlab.local" "pages.gitlab.local" >/dev/null 2>&1
+first_run="$(cat "$_TEST_COREFILE_FILE")"
+echo "$first_run" | grep -q "10.0.0.1 gitlab.local" && \
+    echo "$first_run" | grep -q "10.0.0.1 registry.gitlab.local" && \
+    echo "$first_run" | grep -q "10.0.0.1 pages.gitlab.local" \
+    && pass "cluster_patch_coredns: all given domains are present" || fail "cluster_patch_coredns: all given domains are present"
+
+_saas_gitlab_cluster_patch_coredns "gitlab.local" "registry.gitlab.local" "pages.gitlab.local" >/dev/null 2>&1
+second_run="$(cat "$_TEST_COREFILE_FILE")"
+[ "$(echo "$first_run" | grep -c "saas-gitlab-hosts-begin")" = "1" ] && [ "$(echo "$second_run" | grep -c "saas-gitlab-hosts-begin")" = "1" ] \
+    && pass "cluster_patch_coredns: calling it again with the same domains doesn't duplicate the block" \
+    || fail "cluster_patch_coredns: calling it again with the same domains doesn't duplicate the block"
+
+_saas_gitlab_cluster_patch_coredns "gitlab.local" >/dev/null 2>&1
+third_run="$(cat "$_TEST_COREFILE_FILE")"
+echo "$third_run" | grep -q "registry.gitlab.local" && fail "cluster_patch_coredns: a smaller domain set replaces stale entries" \
+    || pass "cluster_patch_coredns: a smaller domain set replaces stale entries"
+unset -f kubectl
+rm -f "$_TEST_COREFILE_FILE"
+
+# ------------------------------------------------------------------
+# operators.sh: idempotent. 'helm upgrade --install' must not run again once the CRD/release is
+# already present.
+# ------------------------------------------------------------------
+_TEST_HELM_CALLS=0
+kubectl() {
+    case "$*" in
+        "get crd clusters.postgresql.cnpg.io") return 0 ;;
+        "get crd redisreplications.redis.redis.opstreelabs.in") return 0 ;;
+        *"create secret generic"*) : ;;
+        "apply -f -") cat >/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+helm() {
+    case "$1" in
+        upgrade) _TEST_HELM_CALLS=$((_TEST_HELM_CALLS + 1)) ;;
+        status) return 0 ;;
+    esac
+}
+
+_saas_gitlab_operator_cnpg_ensure >/dev/null 2>&1
+_saas_gitlab_operator_redis_ensure >/dev/null 2>&1
+_saas_gitlab_operator_duckdns_webhook_ensure "dummy-token" >/dev/null 2>&1
+[ "$_TEST_HELM_CALLS" -eq 0 ] && pass "operators: already-present CNPG/redis-operator/duckdns-webhook skip 'helm upgrade --install'" \
+    || fail "operators: already-present CNPG/redis-operator/duckdns-webhook skip 'helm upgrade --install' (got $_TEST_HELM_CALLS calls)"
+unset -f kubectl helm
 
 # ------------------------------------------------------------------
 # Summary

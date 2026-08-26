@@ -24,7 +24,7 @@ Single entry point to install and manage self-hosted SaaS services on
 Kubernetes.
 
 Available services:
-  gitlab    Self-hosted GitLab (official Helm chart) — see 'saas gitlab --help'
+  gitlab    Self-hosted GitLab (official Helm chart), see 'saas gitlab --help'
 
 Examples:
   saas gitlab install

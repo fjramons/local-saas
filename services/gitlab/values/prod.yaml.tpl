@@ -1,4 +1,4 @@
-# 'prod' overlay for the gitlab/gitlab chart: resources aligned to the chart's official baseline (~8 vCPU/16GB), 2 replicas on the horizontally-scalable components, external PostgreSQL/Redis/MinIO pointing at the stack deployed by services/gitlab/lib/datastore.sh (single instance — no HA; see CLAUDE.md, known limitation). Container Registry stays disabled in this mode too in this first version — see CLAUDE.md, "Design notes", for why and how to enable it by hand. Variables substituted by envsubst — see services/gitlab/lib/install.sh.
+# 'prod' overlay for the gitlab/gitlab chart: resources aligned to the chart's official baseline (~8 vCPU/16GB), 2 replicas on the horizontally-scalable components. PostgreSQL/Redis/MinIO now run with real HA (CloudNativePG, Redis Sentinel via redis-operator, 4-node distributed MinIO); global.psql/global.redis are supplied by values/datastore-ha.yaml.tpl, always layered on top of this file in --mode prod (see install.sh), not duplicated here. Container Registry defaults here to off (base 'registry.enabled: false') and is layered on by values/registry.yaml.tpl when --registry is enabled (on by default), same for Pages via values/pages.yaml.tpl. Variables substituted by envsubst, see services/gitlab/lib/install.sh.
 global:
   edition: ce
   hosts:
@@ -17,16 +17,6 @@ global:
   initialRootPassword:
     secret: ${SAAS_RELEASE}-gitlab-initial-root-password
     key: password
-  psql:
-    host: ${SAAS_RELEASE}-postgresql.${SAAS_NAMESPACE}.svc.cluster.local
-    username: gitlab
-    password:
-      secret: ${SAAS_RELEASE}-datastore-psql
-      key: password
-  redis:
-    host: ${SAAS_RELEASE}-redis.${SAAS_NAMESPACE}.svc.cluster.local
-    auth:
-      enabled: false
   appConfig:
     object_store:
       enabled: true

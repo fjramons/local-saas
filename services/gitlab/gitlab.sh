@@ -8,8 +8,12 @@ source "$_SAAS_GITLAB_DIR/lib/state.sh"
 source "$_SAAS_GITLAB_DIR/lib/cluster.sh"
 # shellcheck source=lib/versions.sh
 source "$_SAAS_GITLAB_DIR/lib/versions.sh"
+# shellcheck source=lib/operators.sh
+source "$_SAAS_GITLAB_DIR/lib/operators.sh"
 # shellcheck source=lib/datastore.sh
 source "$_SAAS_GITLAB_DIR/lib/datastore.sh"
+# shellcheck source=lib/datastore-ha.sh
+source "$_SAAS_GITLAB_DIR/lib/datastore-ha.sh"
 # shellcheck source=lib/tls.sh
 source "$_SAAS_GITLAB_DIR/lib/tls.sh"
 # shellcheck source=lib/install.sh
@@ -30,7 +34,7 @@ cluster or an existing cluster), manages its lifecycle, and gives access
 to credentials/URL/SSH/CI.
 
 Subcommands:
-  install       Install (or update) GitLab — see 'saas gitlab install --help'
+  install       Install (or update) GitLab, see 'saas gitlab install --help'
   versions      List available chart versions
   status        Status of an installation
   credentials   URL and how to get the root password

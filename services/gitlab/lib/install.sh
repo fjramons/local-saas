@@ -1,6 +1,6 @@
 # --- saas gitlab install|up|down|delete|status
 #
-# 'install' resolves every parameter (flags > interactive prompts > sensible defaults) and delegates the actual provisioning to _saas_gitlab_provision, the same function 'up' uses after reloading the parameters from the saved state (services/gitlab/lib/state.sh) — so there's no second copy of the provisioning logic.
+# 'install' resolves every parameter (flags > interactive prompts > sensible defaults) and delegates the actual provisioning to _saas_gitlab_provision, the same function 'up' uses after reloading the parameters from the saved state (services/gitlab/lib/state.sh), so there's no second copy of the provisioning logic.
 
 _saas_gitlab_valid_mode()   { [[ "$1" == "dev" || "$1" == "prod" ]]; }
 _saas_gitlab_valid_bool()   { [[ "$1" == "true" || "$1" == "false" ]]; }
@@ -12,7 +12,7 @@ _saas_gitlab_install_help() {
     cat <<'EOF'
 Usage: saas gitlab install [OPTIONS]
 
-Installs (or updates in place — it's idempotent) self-hosted GitLab on
+Installs (or updates in place, it's idempotent) self-hosted GitLab on
 Kubernetes: a local kind cluster or an existing cluster via kubeconfig,
 its own PostgreSQL/Redis/MinIO (the official chart no longer bundles
 them), cert-manager + TLS, and a GitLab Runner registered and ready for CI.
@@ -20,7 +20,7 @@ them), cert-manager + TLS, and a GitLab Runner registered and ready for CI.
 Any option that's omitted (except -y/--yes or --non-interactive) is asked
 interactively, suggesting the default value in brackets; without a tty or
 with --non-interactive that default is used silently, warning if it had
-to pick between several ambiguous options (never aborts over that — see
+to pick between several ambiguous options (never aborts over that; see
 'Options with no safe default' below).
 
 Options:
@@ -32,14 +32,14 @@ Options:
                                 default: same as --release)
       --kind-workers N         Number of worker nodes in the kind cluster
                                 (kind only; default: 0)
-      --storage-mode MODE      local-path (default) or nfs — only with
+      --storage-mode MODE      local-path (default) or nfs; only with
                                 --cluster-mode kind, passed through to
                                 kind_cluster
-      --storage-class NAME     StorageClass to use — only with
+      --storage-class NAME     StorageClass to use; only with
                                 --cluster-mode existing (default: the
                                 cluster's default StorageClass is
                                 detected)
-      --mode MODE               dev (default) or prod — see 'Modes'
+      --mode MODE               dev (default) or prod, see 'Modes'
       --version VERSION         Version of the gitlab/gitlab chart, or
                                 'latest' (default). See 'saas gitlab
                                 versions'.
@@ -51,45 +51,62 @@ Options:
                                 letsencrypt (required in --mode prod
                                 unless --force-self-signed-prod)
       --force-self-signed-prod  Allows --mode prod with --tls self-signed
-                                (with a warning) — evaluation/demo only
-      --challenge TYPE           http01 or dns01 — only with --tls
+                                (with a warning); evaluation/demo only
+      --challenge TYPE           http01 or dns01; only with --tls
                                 letsencrypt. Default: dns01 with
                                 --cluster-mode kind (no public
                                 reachability), http01 with --cluster-mode
                                 existing.
-      --dns-provider PROVIDER    cloudflare (default, implemented) or
-                                duckdns (documented, NOT implemented yet
-                                — see CLAUDE.md) — only with --challenge
-                                dns01
-      --dns-token TOKEN          DNS provider API token — required with
+      --dns-provider PROVIDER    cloudflare (default) or duckdns; only
+                                with --challenge dns01. duckdns installs
+                                a third-party cert-manager webhook (the
+                                one deliberate exception in this repo,
+                                since DuckDNS has no native cert-manager
+                                support); cloudflare is native to
+                                cert-manager, no extra component
+      --dns-token TOKEN          DNS provider API token (cloudflare) or
+                                account token (duckdns); required with
                                 --challenge dns01, no safe default
-      --email EMAIL              Let's Encrypt account email — required
+      --email EMAIL              Let's Encrypt account email, required
                                 with --tls letsencrypt, no safe default
       --ingress-class NAME       IngressClass to use (default: nginx)
       --ssh-host-port PORT       Host port mapped to GitLab's internal
-                                SSH (kind only; default: 2222) — doesn't
+                                SSH (kind only; default: 2222). Doesn't
                                 touch the host's real port 22
       --runner                   Deploy and register GitLab Runner
                                 (default)
       --no-runner                 Don't deploy GitLab Runner
+      --registry                  Enable the Container Registry
+                                (default)
+      --no-registry                Disable the Container Registry
+      --pages                      Enable GitLab Pages (its own
+                                subdomain, path-based project URLs so
+                                it works with any TLS challenge type)
+      --no-pages                   Disable GitLab Pages (default)
   -y, --yes                      Don't ask anything; use the default
                                 values without confirmation
       --non-interactive          Same as --yes for the fill-in prompts
   -h, --help                     Show this help
 
 Modes (--mode):
-  dev    1 replica per component, reduced resources, Container
-         Registry/Pages/KAS/Prometheus disabled, self-signed TLS by
-         default — meant for --cluster-mode kind.
+  dev    1 replica per component, reduced resources, GitLab
+         Pages/KAS/Prometheus disabled (Container Registry follows
+         --registry/--no-registry), self-signed TLS by default. Meant
+         for --cluster-mode kind. PostgreSQL/Redis/MinIO: our own
+         single-instance stack, no HA, deliberately unchanged, this
+         mode is meant to be disposable and minimal.
   prod   Replicas/resources aligned to the chart's official baseline
          (~8 vCPU/16GB), Let's Encrypt TLS required unless
-         --force-self-signed-prod. PostgreSQL/Redis/MinIO are still this
-         project's own single instance (no HA), and Container Registry
-         is still disabled in this first version — see CLAUDE.md,
-         "Design notes", for why and how to extend it.
+         --force-self-signed-prod. PostgreSQL/Redis/MinIO now run with
+         real HA (CloudNativePG, Redis Sentinel via redis-operator,
+         4-node distributed MinIO) unconditionally, not an opt-in
+         flag: "prod" means production-grade datastores. One known
+         trade-off: Sentinel-port auth is left disabled, pending an
+         upstream fix, while the Redis data connection itself stays
+         fully password-protected.
 
 Options with no safe default (asked with no suggestion, and DO fail in
---non-interactive if missing — there's no reasonable automatic choice):
+--non-interactive if missing, there's no reasonable automatic choice):
   --domain (with --tls letsencrypt), --email (with --tls letsencrypt),
   --dns-token (with --challenge dns01)
 
@@ -113,16 +130,17 @@ _saas_gitlab_install() {
     local mode="dev" version="latest" domain="" tls="" force_self_signed_prod=false
     local challenge="" dns_provider="cloudflare" dns_token="" email=""
     local ingress_class="nginx" ssh_host_port="2222" runner_enabled=true
+    local registry_enabled=true pages_enabled=false
     local yes=false non_interactive=false
 
     local release_set=false namespace_set=false cluster_mode_set=false kind_name_set=false
     local kind_workers_set=false storage_mode_set=false storage_class_set=false
     local mode_set=false version_set=false domain_set=false tls_set=false
     local challenge_set=false dns_provider_set=false ingress_class_set=false
-    local ssh_host_port_set=false runner_set=false
+    local ssh_host_port_set=false runner_set=false registry_set=false pages_set=false
 
     local args
-    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
+    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,registry,no-registry,pages,no-pages,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
         _saas_gitlab_install_help; return 1
     }
     eval set -- "$args"
@@ -148,6 +166,10 @@ _saas_gitlab_install() {
             --ssh-host-port)         ssh_host_port="$2"; ssh_host_port_set=true; shift 2 ;;
             --runner)                runner_enabled=true; runner_set=true; shift ;;
             --no-runner)             runner_enabled=false; runner_set=true; shift ;;
+            --registry)              registry_enabled=true; registry_set=true; shift ;;
+            --no-registry)           registry_enabled=false; registry_set=true; shift ;;
+            --pages)                 pages_enabled=true; pages_set=true; shift ;;
+            --no-pages)              pages_enabled=false; pages_set=true; shift ;;
             -y|--yes)                yes=true; shift ;;
             --non-interactive)       non_interactive=true; shift ;;
             -h|--help)               _saas_gitlab_install_help; return 0 ;;
@@ -235,17 +257,14 @@ _saas_gitlab_install() {
         if [ "$challenge" = "dns01" ]; then
             $dns_provider_set || dns_provider="$(_saas_prompt_menu "DNS provider" "cloudflare" "$non_interactive" cloudflare duckdns)"
             _saas_gitlab_valid_dns_provider "$dns_provider" || { _saas_log_err "--dns-provider must be 'cloudflare' or 'duckdns'."; return 1; }
-            if [ "$dns_provider" = "duckdns" ]; then
-                _saas_log_err "--dns-provider duckdns is not implemented yet in this version (see CLAUDE.md)."
-                _saas_log_err "Use --dns-provider cloudflare, or --challenge http01 if the ingress is publicly reachable."
-                return 1
-            fi
             [ -n "$dns_token" ] || {
                 if $non_interactive || [ ! -t 0 ]; then
                     _saas_log_err "--dns-token is required with --challenge dns01 (no safe default possible)."
                     return 1
                 fi
-                printf 'Cloudflare API token (required): ' >&2
+                local token_label="Cloudflare API token (required): "
+                [ "$dns_provider" = "duckdns" ] && token_label="DuckDNS account token (required): "
+                printf '%s' "$token_label" >&2
                 read -r dns_token
                 [ -n "$dns_token" ] || { _saas_log_err "Empty token."; return 1; }
             }
@@ -273,6 +292,8 @@ _saas_gitlab_install() {
         $ssh_host_port_set || ssh_host_port="$(_saas_prompt_validated "Host port for GitLab SSH" "$ssh_host_port" "$non_interactive" "must be a port 1-65535" _saas_gitlab_valid_hostport)" || return 1
     fi
     $runner_set || runner_enabled="$(_saas_prompt_bool "Deploy and register GitLab Runner" true "$non_interactive")"
+    $registry_set || registry_enabled="$(_saas_prompt_bool "Enable the Container Registry" true "$non_interactive")"
+    $pages_set || pages_enabled="$(_saas_prompt_bool "Enable GitLab Pages" false "$non_interactive")"
 
     # --- StorageClass (existing cluster only) ---
     if [ "$cluster_mode" = "existing" ]; then
@@ -282,34 +303,69 @@ _saas_gitlab_install() {
     _saas_gitlab_provision "$release" "$namespace" "$cluster_mode" "$kind_name" "$kind_workers" \
         "$storage_mode" "$storage_class" "$mode" "$version" "$domain" "$tls" "$issuer_name" \
         "$challenge" "$dns_provider" "$dns_token" "$email" "$ingress_class" "$ssh_host_port" \
-        "$runner_enabled" "" "" "" ""
+        "$runner_enabled" "$registry_enabled" "$pages_enabled" "" "" "" "" ""
 }
 
 # _saas_gitlab_provision RELEASE NAMESPACE CLUSTER_MODE KIND_NAME KIND_WORKERS \
 #   STORAGE_MODE STORAGE_CLASS MODE VERSION DOMAIN TLS ISSUER_NAME \
 #   CHALLENGE DNS_PROVIDER DNS_TOKEN EMAIL INGRESS_CLASS SSH_HOST_PORT \
-#   RUNNER_ENABLED PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD ROOT_PASSWORD
+#   RUNNER_ENABLED REGISTRY_ENABLED PAGES_ENABLED \
+#   PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD ROOT_PASSWORD REDIS_PASSWORD
 #
-# Actually provisions everything (cluster, datastore, TLS, chart, runner, ssh) and persists the state. The last four credential parameters, if empty, are generated here (first install); if non-empty (called from 'up', reusing the saved state), they're reused as-is so as not to break data already persisted on disk.
+# Actually provisions everything (cluster, datastore, TLS, chart, runner, ssh) and persists the state. The last five credential parameters, if empty, are generated here (first install); if non-empty (called from 'up', reusing the saved state), they're reused as-is so as not to break data already persisted on disk.
 #
-# ROOT_PASSWORD deserves an explanation: GitLab only sets the initial 'root' password in the database the very first time it boots with no admin user yet. After 'down'/'up' the database persists (with that password already baked in) but the Secret holding it does NOT — if the chart were left to generate a new random one on every reinstall, the Secret would no longer match the database's real password. That's why we generate and persist it ourselves (same as PSQL_PASSWORD and the MinIO credentials) and pass it to the chart via global.initialRootPassword — the chart is never left to invent it on its own.
+# ROOT_PASSWORD deserves an explanation: GitLab only sets the initial 'root' password in the database the very first time it boots with no admin user yet. After 'down'/'up' the database persists (with that password already baked in) but the Secret holding it does NOT. If the chart were left to generate a new random one on every reinstall, the Secret would no longer match the database's real password. That's why we generate and persist it ourselves (same as PSQL_PASSWORD and the MinIO credentials) and pass it to the chart via global.initialRootPassword; the chart is never left to invent it on its own.
+#
+# REDIS_PASSWORD is only ever used in --mode prod (real HA Redis via redis-operator, password-protected); --mode dev keeps its always-password-less single-instance Redis (see datastore.sh). A disposable, ClusterIP-only local cluster gains no real security from a password, and dev is deliberately out of scope for the HA/security hardening this parameter exists for.
+
+# _saas_gitlab_issue_letsencrypt_dns01 ISSUER_NAME EMAIL TOKEN PROVIDER
+# Small dispatch, pulled out of _saas_gitlab_provision so it's unit-testable on its own (stub the two
+# issuer functions and assert the right one gets called for each PROVIDER).
+_saas_gitlab_issue_letsencrypt_dns01() {
+    local issuer_name="$1" email="$2" token="$3" provider="$4"
+    case "$provider" in
+        cloudflare) _saas_gitlab_certmanager_issuer_letsencrypt_dns01_cloudflare "$issuer_name" "$email" "$token" ;;
+        duckdns)    _saas_gitlab_certmanager_issuer_letsencrypt_dns01_duckdns "$issuer_name" "$email" "$token" ;;
+        *) _saas_log_err "Unknown DNS-01 provider: '$provider'."; return 1 ;;
+    esac
+}
+
+# _saas_gitlab_render_values_layer SRC DOMAIN RELEASE NAMESPACE INGRESS_CLASS TLS_SECRET
+# Renders one values template (envsubst) into a fresh temp file, printing its path on stdout. Several of these get layered as successive '-f' arguments to 'helm upgrade --install' (see _saas_gitlab_provision): base mode overlay, then optional datastore-ha/registry/pages fragments, in that order, so a later one's keys win over an earlier one's on overlap.
+_saas_gitlab_render_values_layer() {
+    local src="$1" domain="$2" release="$3" namespace="$4" ingress_class="$5" tls_secret="$6"
+    local out
+    out="$(mktemp "${TMPDIR:-/tmp}/saas-gitlab-values-XXXXXX.yaml")" || return 1
+    SAAS_DOMAIN="$domain" SAAS_RELEASE="$release" SAAS_NAMESPACE="$namespace" \
+        SAAS_INGRESS_CLASS="$ingress_class" SAAS_TLS_SECRET="$tls_secret" \
+        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET}' \
+        < "$src" > "$out" || return 1
+    echo "$out"
+}
+
 _saas_gitlab_provision() {
     local release="$1" namespace="$2" cluster_mode="$3" kind_name="$4" kind_workers="$5"
     local storage_mode="$6" storage_class="$7" mode="$8" version="$9" domain="${10}" tls="${11}" issuer_name="${12}"
     local challenge="${13}" dns_provider="${14}" dns_token="${15}" email="${16}" ingress_class="${17}" ssh_host_port="${18}"
-    local runner_enabled="${19}" psql_password="${20}" minio_user="${21}" minio_password="${22}" root_password="${23}"
+    local runner_enabled="${19}" registry_enabled="${20}" pages_enabled="${21}"
+    local psql_password="${22}" minio_user="${23}" minio_password="${24}" root_password="${25}" redis_password="${26}"
 
     [ -n "$psql_password" ] || psql_password="$(_saas_random_password 32)"
     [ -n "$minio_user" ]    || minio_user="gitlab-minio"
     [ -n "$minio_password" ] || minio_password="$(_saas_random_password 32)"
     [ -n "$root_password" ] || root_password="$(_saas_random_password 24)"
+    [ -n "$redis_password" ] || redis_password="$(_saas_random_password 32)"
 
     # Early checkpoint: if something fails further down, a retried 'install' over the same --release reuses these credentials instead of generating new ones that would no longer match data that already made it to disk.
     _saas_gitlab_state_save "$release" \
         "RELEASE=$release" "NAMESPACE=$namespace" "CLUSTER_MODE=$cluster_mode" \
         "PSQL_PASSWORD=$psql_password" "MINIO_ROOT_USER=$minio_user" "MINIO_ROOT_PASSWORD=$minio_password" \
-        "ROOT_PASSWORD=$root_password" \
+        "ROOT_PASSWORD=$root_password" "REDIS_PASSWORD=$redis_password" \
         "STATUS=provisioning"
+
+    local -a extra_sans=()
+    [ "$registry_enabled" = "true" ] && extra_sans+=("registry.${domain}")
+    [ "$pages_enabled" = "true" ] && extra_sans+=("pages.${domain}")
 
     if [ "$cluster_mode" = "kind" ]; then
         if _saas_gitlab_cluster_exists "$kind_name"; then
@@ -319,12 +375,18 @@ _saas_gitlab_provision() {
         fi
         _saas_gitlab_cluster_use "$kind_name" || return 1
         storage_class=""
-        _saas_gitlab_cluster_patch_coredns "$domain"
+        _saas_gitlab_cluster_patch_coredns "$domain" "${extra_sans[@]}"
     fi
 
-    _saas_log_step "Deploying our own PostgreSQL/Redis/MinIO…"
-    _saas_gitlab_datastore_apply "$namespace" "$release" "$mode" "$storage_class" \
-        "$psql_password" "$minio_user" "$minio_password" || return 1
+    if [ "$mode" = "prod" ]; then
+        _saas_log_step "Deploying HA PostgreSQL/Redis/MinIO…"
+        _saas_gitlab_datastore_ha_apply "$namespace" "$release" "$storage_class" \
+            "$psql_password" "$minio_user" "$minio_password" "$redis_password" || return 1
+    else
+        _saas_log_step "Deploying our own PostgreSQL/Redis/MinIO…"
+        _saas_gitlab_datastore_apply "$namespace" "$release" "$storage_class" \
+            "$psql_password" "$minio_user" "$minio_password" || return 1
+    fi
 
     _saas_log_step "Configuring TLS (cert-manager)…"
     _saas_gitlab_certmanager_ensure || return 1
@@ -336,48 +398,59 @@ _saas_gitlab_provision() {
             if [ "$challenge" = "http01" ]; then
                 _saas_gitlab_certmanager_issuer_letsencrypt_http01 "$issuer_name" "$email" "$ingress_class" || return 1
             else
-                _saas_gitlab_certmanager_issuer_letsencrypt_dns01_cloudflare "$issuer_name" "$email" "$dns_token" || return 1
+                _saas_gitlab_issue_letsencrypt_dns01 "$issuer_name" "$email" "$dns_token" "$dns_provider" || return 1
             fi
             ;;
     esac
     local tls_secret="${release}-gitlab-tls"
-    _saas_gitlab_certificate_request "$namespace" "${release}-gitlab-cert" "$domain" "$issuer_name" "$tls_secret" || return 1
+    _saas_gitlab_certificate_request "$namespace" "${release}-gitlab-cert" "$domain" "$issuer_name" "$tls_secret" "${extra_sans[@]}" || return 1
 
     kubectl -n "$namespace" create secret generic "${release}-gitlab-initial-root-password" \
         --from-literal=password="$root_password" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
-    _saas_log_step "Installing GitLab (chart gitlab/gitlab @ ${version}) — this can take several minutes…"
+    _saas_log_step "Installing GitLab (chart gitlab/gitlab @ ${version}), this can take several minutes…"
     _saas_gitlab_helm_repo_ensure || return 1
     local tpl_file="$_SAAS_GITLAB_DIR/values/${mode}.yaml.tpl"
     [ -f "$tpl_file" ] || { _saas_log_err "The values template '$tpl_file' doesn't exist."; return 1; }
 
-    local rendered
-    rendered="$(mktemp "${TMPDIR:-/tmp}/saas-gitlab-values-XXXXXX.yaml")" || return 1
-    SAAS_DOMAIN="$domain" SAAS_RELEASE="$release" SAAS_NAMESPACE="$namespace" \
-        SAAS_INGRESS_CLASS="$ingress_class" SAAS_TLS_SECRET="$tls_secret" \
-        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET}' \
-        < "$tpl_file" > "$rendered"
+    local -a rendered_files=() value_files=()
+    local layer
+
+    layer="$(_saas_gitlab_render_values_layer "$tpl_file" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret")" || { rm -f "${rendered_files[@]}"; return 1; }
+    rendered_files+=("$layer"); value_files+=(-f "$layer")
+    if [ "$mode" = "prod" ]; then
+        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/datastore-ha.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret")" || { rm -f "${rendered_files[@]}"; return 1; }
+        rendered_files+=("$layer"); value_files+=(-f "$layer")
+    fi
+    if [ "$registry_enabled" = "true" ]; then
+        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/registry.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret")" || { rm -f "${rendered_files[@]}"; return 1; }
+        rendered_files+=("$layer"); value_files+=(-f "$layer")
+    fi
+    if [ "$pages_enabled" = "true" ]; then
+        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/pages.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret")" || { rm -f "${rendered_files[@]}"; return 1; }
+        rendered_files+=("$layer"); value_files+=(-f "$layer")
+    fi
 
     helm upgrade --install "$release" gitlab/gitlab \
         --namespace "$namespace" --create-namespace \
-        --version "$version" -f "$rendered" \
+        --version "$version" "${value_files[@]}" \
         --timeout 20m --wait
     local helm_status=$?
-    rm -f "$rendered"
+    rm -f "${rendered_files[@]}"
     [ "$helm_status" -eq 0 ] || { _saas_log_err "The GitLab chart install failed."; return 1; }
 
     if [ "$runner_enabled" = "true" ]; then
         _saas_log_step "Deploying and registering GitLab Runner…"
         _saas_gitlab_runner_install "$namespace" "$release" "$domain" || \
-            _saas_log_warn "GitLab Runner could not be deployed/registered — retry with 'saas gitlab runner reregister $release'."
+            _saas_log_warn "GitLab Runner could not be deployed/registered. Retry with 'saas gitlab runner reregister $release'."
     fi
 
     local ssh_note=""
     if [ "$cluster_mode" = "kind" ]; then
         _saas_log_step "Exposing GitLab SSH on host port ${ssh_host_port}…"
         _saas_gitlab_ssh_expose "$kind_name" "$namespace" "$release" "$ssh_host_port" || \
-            _saas_log_warn "Could not expose GitLab SSH — retry with 'saas gitlab ssh-config $release'."
+            _saas_log_warn "Could not expose GitLab SSH. Retry with 'saas gitlab ssh-config $release'."
     fi
 
     _saas_gitlab_state_save "$release" \
@@ -386,8 +459,9 @@ _saas_gitlab_provision() {
         "MODE=$mode" "VERSION=$version" "DOMAIN=$domain" "TLS=$tls" "ISSUER_NAME=$issuer_name" \
         "CHALLENGE=$challenge" "DNS_PROVIDER=$dns_provider" "EMAIL=$email" \
         "INGRESS_CLASS=$ingress_class" "SSH_HOST_PORT=$ssh_host_port" "RUNNER_ENABLED=$runner_enabled" \
+        "REGISTRY_ENABLED=$registry_enabled" "PAGES_ENABLED=$pages_enabled" \
         "PSQL_PASSWORD=$psql_password" "MINIO_ROOT_USER=$minio_user" "MINIO_ROOT_PASSWORD=$minio_password" \
-        "ROOT_PASSWORD=$root_password" \
+        "ROOT_PASSWORD=$root_password" "REDIS_PASSWORD=$redis_password" \
         "STATUS=up"
 
     _saas_log_ok "GitLab '$release' is ready."
@@ -400,11 +474,11 @@ Usage: saas gitlab up [RELEASE] [OPTIONS]
 
 Recreates RELEASE's kind cluster (previously destroyed with 'saas gitlab
 down', without --purge-storage) and reinstalls GitLab reusing the state
-saved from the original install — same credentials, same domain, same
+saved from the original install: same credentials, same domain, same
 data. Only applies to installs with --cluster-mode kind.
 
-Cost: several minutes of startup time (recreating the cluster +
-reinstalling the chart) — not an instant resume, see 'saas gitlab down
+Cost: several minutes of startup time (recreating the cluster and
+reinstalling the chart), not an instant resume. See 'saas gitlab down
 --help'.
 
 Options:
@@ -439,8 +513,9 @@ _saas_gitlab_up() {
         "$SAAS_GITLAB_STATE_MODE" "$SAAS_GITLAB_STATE_VERSION" "$SAAS_GITLAB_STATE_DOMAIN" "$SAAS_GITLAB_STATE_TLS" \
         "$SAAS_GITLAB_STATE_ISSUER_NAME" "$SAAS_GITLAB_STATE_CHALLENGE" "$SAAS_GITLAB_STATE_DNS_PROVIDER" "" \
         "$SAAS_GITLAB_STATE_EMAIL" "$SAAS_GITLAB_STATE_INGRESS_CLASS" "$SAAS_GITLAB_STATE_SSH_HOST_PORT" \
-        "$SAAS_GITLAB_STATE_RUNNER_ENABLED" "$SAAS_GITLAB_STATE_PSQL_PASSWORD" "$SAAS_GITLAB_STATE_MINIO_ROOT_USER" \
-        "$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_ROOT_PASSWORD"
+        "$SAAS_GITLAB_STATE_RUNNER_ENABLED" "$SAAS_GITLAB_STATE_REGISTRY_ENABLED" "$SAAS_GITLAB_STATE_PAGES_ENABLED" \
+        "$SAAS_GITLAB_STATE_PSQL_PASSWORD" "$SAAS_GITLAB_STATE_MINIO_ROOT_USER" \
+        "$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_REDIS_PASSWORD"
 }
 
 _saas_gitlab_down_help() {
@@ -449,7 +524,7 @@ Usage: saas gitlab down [RELEASE] [OPTIONS]
 
 Destroys RELEASE's kind cluster (host CPU/RAM usage drops to zero) while
 preserving the data (PostgreSQL/Redis/MinIO/Gitaly) in the host's storage
-directory — 'saas gitlab up' recovers it when recreating the cluster.
+directory. 'saas gitlab up' recovers it when recreating the cluster.
 Only applies to installs with --cluster-mode kind.
 
 Options:
@@ -489,8 +564,9 @@ _saas_gitlab_down() {
         "MODE=$SAAS_GITLAB_STATE_MODE" "VERSION=$SAAS_GITLAB_STATE_VERSION" "DOMAIN=$SAAS_GITLAB_STATE_DOMAIN" "TLS=$SAAS_GITLAB_STATE_TLS" "ISSUER_NAME=$SAAS_GITLAB_STATE_ISSUER_NAME" \
         "CHALLENGE=$SAAS_GITLAB_STATE_CHALLENGE" "DNS_PROVIDER=$SAAS_GITLAB_STATE_DNS_PROVIDER" "EMAIL=$SAAS_GITLAB_STATE_EMAIL" \
         "INGRESS_CLASS=$SAAS_GITLAB_STATE_INGRESS_CLASS" "SSH_HOST_PORT=$SAAS_GITLAB_STATE_SSH_HOST_PORT" "RUNNER_ENABLED=$SAAS_GITLAB_STATE_RUNNER_ENABLED" \
+        "REGISTRY_ENABLED=$SAAS_GITLAB_STATE_REGISTRY_ENABLED" "PAGES_ENABLED=$SAAS_GITLAB_STATE_PAGES_ENABLED" \
         "PSQL_PASSWORD=$SAAS_GITLAB_STATE_PSQL_PASSWORD" "MINIO_ROOT_USER=$SAAS_GITLAB_STATE_MINIO_ROOT_USER" "MINIO_ROOT_PASSWORD=$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" \
-        "ROOT_PASSWORD=$SAAS_GITLAB_STATE_ROOT_PASSWORD" \
+        "ROOT_PASSWORD=$SAAS_GITLAB_STATE_ROOT_PASSWORD" "REDIS_PASSWORD=$SAAS_GITLAB_STATE_REDIS_PASSWORD" \
         "STATUS=down"
     _saas_log_ok "kind cluster '$SAAS_GITLAB_STATE_KIND_NAME' destroyed. Data preserved. Use 'saas gitlab up $release' to bring it back up."
 }
@@ -504,7 +580,7 @@ kind) the cluster itself. Also removes the saved state.
 
 Options:
       --purge-storage   Also removes the data persisted on the host
-                        (--cluster-mode kind only) — irreversible
+                        (--cluster-mode kind only). Irreversible
   -y, --yes             Don't ask for confirmation
   -h, --help             Show this help
 
@@ -539,7 +615,11 @@ _saas_gitlab_delete() {
     else
         helm uninstall "$SAAS_GITLAB_STATE_RELEASE" --namespace "$SAAS_GITLAB_STATE_NAMESPACE" 2>/dev/null
         kubectl delete clusterissuer "$SAAS_GITLAB_STATE_ISSUER_NAME" --ignore-not-found >/dev/null 2>&1
-        _saas_gitlab_datastore_delete "$SAAS_GITLAB_STATE_NAMESPACE" "$SAAS_GITLAB_STATE_RELEASE"
+        if [ "$SAAS_GITLAB_STATE_MODE" = "prod" ]; then
+            _saas_gitlab_datastore_ha_delete "$SAAS_GITLAB_STATE_NAMESPACE" "$SAAS_GITLAB_STATE_RELEASE"
+        else
+            _saas_gitlab_datastore_delete "$SAAS_GITLAB_STATE_NAMESPACE" "$SAAS_GITLAB_STATE_RELEASE"
+        fi
         $purge && kubectl delete namespace "$SAAS_GITLAB_STATE_NAMESPACE" --ignore-not-found >/dev/null 2>&1
     fi
 
@@ -574,6 +654,8 @@ _saas_gitlab_status() {
     echo "Domain:         $SAAS_GITLAB_STATE_DOMAIN"
     echo "TLS:            $SAAS_GITLAB_STATE_TLS"
     echo "Runner:         $SAAS_GITLAB_STATE_RUNNER_ENABLED"
+    echo "Registry:       $SAAS_GITLAB_STATE_REGISTRY_ENABLED"
+    echo "Pages:          $SAAS_GITLAB_STATE_PAGES_ENABLED"
     echo "Saved status:   $SAAS_GITLAB_STATE_STATUS"
 
     if [ "$SAAS_GITLAB_STATE_CLUSTER_MODE" = "kind" ] && ! _saas_gitlab_cluster_exists "$SAAS_GITLAB_STATE_KIND_NAME" 2>/dev/null; then

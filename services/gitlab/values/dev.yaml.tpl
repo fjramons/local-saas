@@ -1,4 +1,4 @@
-# 'dev' overlay for the gitlab/gitlab chart: reduced resources, a single replica per component, Container Registry/Pages/KAS/Prometheus/Grafana disabled, external PostgreSQL/Redis/MinIO pointing at the minimal stack deployed by services/gitlab/lib/datastore.sh. Variables substituted by envsubst — see services/gitlab/lib/install.sh.
+# 'dev' overlay for the gitlab/gitlab chart: reduced resources, a single replica per component, KAS/Prometheus/Grafana disabled, external PostgreSQL/Redis/MinIO pointing at the minimal single-instance stack deployed by services/gitlab/lib/datastore.sh (deliberately no HA). Container Registry/Pages default here to off (base 'registry.enabled: false', Pages already off by chart default) and are layered on separately by values/registry.yaml.tpl / values/pages.yaml.tpl when --registry/--pages are enabled (see install.sh). Variables substituted by envsubst, see services/gitlab/lib/install.sh.
 global:
   edition: ce
   hosts:

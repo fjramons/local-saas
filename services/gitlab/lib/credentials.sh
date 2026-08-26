@@ -28,7 +28,7 @@ _saas_gitlab_credentials() {
     if [ "$SAAS_GITLAB_STATE_TLS" = "self-signed" ]; then
         echo ""
         echo "Self-signed TLS: the browser (and 'git'/'curl') will warn about an"
-        echo "untrusted certificate — expected with --tls self-signed. To trust it:"
+        echo "untrusted certificate, expected with --tls self-signed. To trust it:"
         echo "  kubectl -n ${SAAS_GITLAB_STATE_NAMESPACE} get secret ${release}-gitlab-tls -o jsonpath='{.data.tls\\.crt}' | base64 -d > ${release}-ca.crt"
     fi
     if [ "$SAAS_GITLAB_STATE_CLUSTER_MODE" = "kind" ]; then

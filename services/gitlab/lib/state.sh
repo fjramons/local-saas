@@ -1,4 +1,4 @@
-# --- State of 'saas gitlab' itself (a deliberate exception to kind_cluster's "no state file of its own" convention — see CLAUDE.md, "Design notes"). Needed because the down/up cycle destroys the whole kind cluster (and with it every Kubernetes object), and it must be possible to recreate an identical install without retyping every flag.
+# --- State of 'saas gitlab' itself (a deliberate exception to kind_cluster's "no state file of its own" convention). Needed because the down/up cycle destroys the whole kind cluster (and with it every Kubernetes object), and it must be possible to recreate an identical install without retyping every flag.
 #
 # Format: one file per release, 'KEY=value' lines with safe quoting via 'printf %q', meant to be sourced directly.
 
@@ -49,7 +49,8 @@ _saas_gitlab_state_save_key() {
 
     local -a fields=(RELEASE NAMESPACE CLUSTER_MODE KIND_NAME KIND_WORKERS STORAGE_MODE STORAGE_CLASS
         MODE VERSION DOMAIN TLS ISSUER_NAME CHALLENGE DNS_PROVIDER EMAIL INGRESS_CLASS SSH_HOST_PORT
-        RUNNER_ENABLED PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD ROOT_PASSWORD STATUS RUNNER_TOKEN)
+        RUNNER_ENABLED REGISTRY_ENABLED PAGES_ENABLED PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+        ROOT_PASSWORD REDIS_PASSWORD STATUS RUNNER_TOKEN)
     local -a pairs=()
     local field current
     for field in "${fields[@]}"; do

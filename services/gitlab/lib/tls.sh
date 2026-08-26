@@ -1,10 +1,9 @@
 # --- cert-manager + TLS certificate issuance for 'saas gitlab'.
 #
-# --tls self-signed: 'selfSigned' ClusterIssuer — zero external dependencies, ideal for --mode dev / local kind without exposing it to the internet.
+# --tls self-signed: 'selfSigned' ClusterIssuer, zero external dependencies, ideal for --mode dev / local kind without exposing it to the internet.
 # --tls letsencrypt --challenge http01: needs the ingress to be reachable from the internet on port 80 (that's how Let's Encrypt validates domain ownership).
-# --tls letsencrypt --challenge dns01 --dns-provider cloudflare: doesn't need public reachability — proves domain ownership by creating a TXT record via the DNS provider's API. The only provider with native support implemented in this first version (cert-manager supports it without a third-party webhook). Requires the domain to be delegated to Cloudflare.
-#
-# 'duckdns' is documented as a free "no domain of your own needed" option for DNS-01 (see README/CLAUDE.md) but is NOT implemented yet: it needs a third-party cert-manager webhook that couldn't be verified from this environment without compromising the reliability of the delivered code — see CLAUDE.md, "Design notes", for the extension point.
+# --tls letsencrypt --challenge dns01 --dns-provider cloudflare: doesn't need public reachability. Proves domain ownership by creating a TXT record via the DNS provider's API. cert-manager supports it natively, no third-party webhook. Requires the domain to be delegated to Cloudflare.
+# --tls letsencrypt --challenge dns01 --dns-provider duckdns: same idea, for a free '<sub>.duckdns.org' domain. DuckDNS has no native cert-manager support, so this is the ONE deliberate, explicitly-approved exception in this repo to "cert-manager-native only": it installs the third-party webhook 'cobexer/cert-manager-webhook-duckdns' (see operators.sh). Cloudflare and any future provider must stay cert-manager-native; adding another webhook needs an equally explicit decision, not a precedent from this one.
 
 _saas_gitlab_valid_tls_mode()       { [[ "$1" == "self-signed" || "$1" == "letsencrypt" ]]; }
 _saas_gitlab_valid_challenge()      { [[ "$1" == "http01" || "$1" == "dns01" ]]; }
@@ -89,10 +88,45 @@ spec:
 EOF
 }
 
-# _saas_gitlab_certificate_request NAMESPACE NAME DOMAIN ISSUER SECRET_NAME
-# Creates/updates a Certificate and waits (up to 180s) for it to become Ready.
+# _saas_gitlab_certmanager_issuer_letsencrypt_dns01_duckdns NAME EMAIL TOKEN [SERVER]
+# TOKEN: the DuckDNS account token (https://www.duckdns.org, shown on the account page).
+# The token secret is shared cluster-wide by design (the webhook's own RBAC restricts its
+# Secret-read permission to one fixed name, see operators.sh). Multiple releases using
+# --dns-provider duckdns in the same cluster necessarily share one DuckDNS account token.
+_saas_gitlab_certmanager_issuer_letsencrypt_dns01_duckdns() {
+    local name="$1" email="$2" token="$3" server="${4:-https://acme-v02.api.letsencrypt.org/directory}"
+
+    _saas_gitlab_operator_duckdns_webhook_ensure "$token" || return 1
+
+    kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: ${name}
+spec:
+  acme:
+    server: ${server}
+    email: ${email}
+    privateKeySecretRef: {name: ${name}-account-key}
+    solvers:
+      - dns01:
+          webhook:
+            groupName: ${_SAAS_GITLAB_DUCKDNS_WEBHOOK_GROUP_NAME}
+            solverName: ${_SAAS_GITLAB_DUCKDNS_WEBHOOK_SOLVER_NAME}
+            config:
+              apiTokenSecretRef: {name: ${_SAAS_GITLAB_DUCKDNS_WEBHOOK_SECRET_NAME}, key: token}
+EOF
+}
+
+# _saas_gitlab_certificate_request NAMESPACE NAME DOMAIN ISSUER SECRET_NAME [EXTRA_SAN...]
+# Creates/updates a Certificate and waits (up to 180s) for it to become Ready. EXTRA_SAN entries
+# (e.g. registry.<domain>, pages.<domain>) are added as extra dnsNames on the SAME certificate,
+# deliberately not a separate certificate or a wildcard, so runner.sh's existing certsSecretName
+# mechanism keeps trusting the one CA/leaf pair without any change.
 _saas_gitlab_certificate_request() {
     local ns="$1" name="$2" domain="$3" issuer="$4" secret_name="$5"
+    shift 5
+    local -a dns_names=("$domain" "$@")
 
     kubectl -n "$ns" apply -f - <<EOF || return 1
 apiVersion: cert-manager.io/v1
@@ -101,7 +135,7 @@ metadata:
   name: ${name}
 spec:
   secretName: ${secret_name}
-  dnsNames: [${domain}]
+  dnsNames: [$(IFS=,; echo "${dns_names[*]}")]
   issuerRef: {name: ${issuer}, kind: ClusterIssuer}
 EOF
 

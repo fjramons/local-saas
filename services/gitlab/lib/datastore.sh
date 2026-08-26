@@ -1,8 +1,8 @@
-# --- Minimal PostgreSQL/Redis/MinIO for 'saas gitlab'.
+# --- Minimal PostgreSQL/Redis/MinIO for 'saas gitlab' (--mode dev; --mode prod uses datastore-ha.sh instead).
 #
-# Design finding (see CLAUDE.md): the official gitlab/gitlab chart no longer bundles PostgreSQL/Redis/MinIO (as of a certain version it requires EXTERNAL PostgreSQL/Redis/object storage — confirmed live with 'helm show values gitlab/gitlab'). Since this project is "self-hosted, no external dependencies", we deploy our own single-instance PostgreSQL/Redis/MinIO (plain manifests, no third-party chart) to cover that gap. This is not high availability — documented as a known limitation, see CLAUDE.md.
+# Design finding: the official gitlab/gitlab chart no longer bundles PostgreSQL/Redis/MinIO (as of a certain version it requires EXTERNAL PostgreSQL/Redis/object storage, confirmed live with 'helm show values gitlab/gitlab'). Since this project is "self-hosted, no external dependencies", --mode dev deploys its own single-instance PostgreSQL/Redis/MinIO (plain manifests, no third-party chart) to cover that gap. Deliberately no HA: a disposable local stack where a password-protected Redis or multi-replica anything buys nothing real. --mode prod instead gets genuine HA via third-party operators, see datastore-ha.sh.
 #
-# The credentials (PostgreSQL password, MinIO root credentials) are generated once and persisted in 'saas gitlab''s own state (services/gitlab/lib/state.sh) so that the down/up cycle (which recreates these Secrets from scratch) keeps using the SAME password already baked into the data files preserved on the host — if they didn't match, PostgreSQL would start up with data that no longer accepts that password.
+# The credentials (PostgreSQL password, MinIO root credentials) are generated once and persisted in 'saas gitlab''s own state (services/gitlab/lib/state.sh) so that the down/up cycle (which recreates these Secrets from scratch) keeps using the SAME password already baked into the data files preserved on the host. If they didn't match, PostgreSQL would start up with data that no longer accepts that password.
 
 _SAAS_GITLAB_MINIO_BUCKETS=(
     registry git-lfs gitlab-artifacts gitlab-uploads gitlab-packages
@@ -11,25 +11,19 @@ _SAAS_GITLAB_MINIO_BUCKETS=(
     gitlab-dependency-proxy gitlab-backups gitlab-pages
 )
 
-# _saas_gitlab_datastore_apply NAMESPACE RELEASE MODE STORAGE_CLASS PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
-_saas_gitlab_datastore_apply() {
-    local ns="$1" release="$2" mode="$3" storage_class="$4"
-    local psql_password="$5" minio_user="$6" minio_password="$7"
-
-    local psql_storage="2Gi" minio_storage="5Gi"
-    local psql_cpu="200m" psql_mem="512Mi" minio_cpu="100m" minio_mem="256Mi" redis_cpu="50m" redis_mem="128Mi"
-    if [ "$mode" = "prod" ]; then
-        psql_storage="20Gi"; minio_storage="50Gi"
-        psql_cpu="1"; psql_mem="2Gi"; minio_cpu="500m"; minio_mem="1Gi"; redis_cpu="200m"; redis_mem="512Mi"
-    fi
-
-    local sc_field=""
-    [ -n "$storage_class" ] && sc_field="  storageClassName: ${storage_class}"
+# _saas_gitlab_datastore_secrets_apply NAMESPACE RELEASE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# Secrets shared by both --mode dev (this file) and --mode prod (datastore-ha.sh), same names/keys
+# in both modes, so the values templates never need to know which datastore backs them.
+_saas_gitlab_datastore_secrets_apply() {
+    local ns="$1" release="$2" psql_password="$3" minio_user="$4" minio_password="$5"
 
     kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
+    # kubernetes.io/basic-auth (username+password) so the same Secret can also be pre-seeded as a
+    # CloudNativePG 'bootstrap.initdb.secret' in --mode prod (CNPG requires that exact type/shape).
     kubectl -n "$ns" create secret generic "${release}-datastore-psql" \
-        --from-literal=password="$psql_password" \
+        --type=kubernetes.io/basic-auth \
+        --from-literal=username=gitlab --from-literal=password="$psql_password" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
     kubectl -n "$ns" create secret generic "${release}-datastore-minio" \
@@ -51,7 +45,7 @@ EOF
         --from-literal=connection="$objectstore_connection" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
-    # The chart's toolbox (also used by us to mint the 'root' PAT for runner registration) unconditionally copies an .s3cfg file (s3cmd format) on startup whenever backups.objectStorage.backend is 's3' (the default) — verified in practice: without this secret, the toolbox pod goes into CrashLoopBackOff even if no backup functionality is ever used. We give it one pointing at the same MinIO.
+    # The chart's toolbox (also used by us to mint the 'root' PAT for runner registration) unconditionally copies an .s3cfg file (s3cmd format) on startup whenever backups.objectStorage.backend is 's3' (the default). Verified in practice: without this secret, the toolbox pod goes into CrashLoopBackOff even if no backup functionality is ever used. We give it one pointing at the same MinIO.
     local s3cfg
     s3cfg="$(cat <<EOF
 [default]
@@ -66,6 +60,41 @@ EOF
     kubectl -n "$ns" create secret generic "${release}-datastore-s3cfg" \
         --from-literal=config="$s3cfg" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
+
+    # Container Registry storage config: the registry subchart does NOT reuse global.appConfig.object_store
+    # (verified against the chart's own values.yaml). It needs its own 'registry.storage.secret', a
+    # Secret whose 'config' key is the registry's native S3 driver config, spliced into its config.yml at
+    # startup. Created unconditionally (cheap, harmless if --registry is off), same precedent as .s3cfg above.
+    local registry_storage
+    registry_storage="$(cat <<EOF
+s3:
+  bucket: registry
+  v4auth: true
+  regionendpoint: http://${release}-minio.${ns}.svc.cluster.local:9000
+  region: minio
+  accesskey: ${minio_user}
+  secretkey: ${minio_password}
+  secure: false
+EOF
+)"
+    kubectl -n "$ns" create secret generic "${release}-datastore-registry-storage" \
+        --from-literal=config="$registry_storage" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
+}
+
+# _saas_gitlab_datastore_apply NAMESPACE RELEASE STORAGE_CLASS PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# --mode dev only (see datastore-ha.sh for --mode prod).
+_saas_gitlab_datastore_apply() {
+    local ns="$1" release="$2" storage_class="$3"
+    local psql_password="$4" minio_user="$5" minio_password="$6"
+
+    local psql_storage="2Gi" minio_storage="5Gi"
+    local psql_cpu="200m" psql_mem="512Mi" minio_cpu="100m" minio_mem="256Mi" redis_cpu="50m" redis_mem="128Mi"
+
+    local sc_field=""
+    [ -n "$storage_class" ] && sc_field="  storageClassName: ${storage_class}"
+
+    _saas_gitlab_datastore_secrets_apply "$ns" "$release" "$psql_password" "$minio_user" "$minio_password" || return 1
 
     kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: v1
@@ -226,6 +255,90 @@ EOF
     _saas_log_ok "PostgreSQL/Redis/MinIO ready."
 }
 
+# _saas_gitlab_datastore_minio_ha_apply NAMESPACE RELEASE STORAGE_CLASS MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# --mode prod: 4-node MinIO distributed mode, MinIO's own clustering via its startup command, no
+# operator needed. The normal ClusterIP Service '${release}-minio' is kept identical to --mode dev
+# (same name, selects all 4 pods) so every client (objectstore/.s3cfg/registry-storage secrets, the
+# bucket-init Job below) is completely unaware of whether MinIO is 1 or 4 nodes.
+_saas_gitlab_datastore_minio_ha_apply() {
+    local ns="$1" release="$2" storage_class="$3" minio_user="$4" minio_password="$5"
+
+    local minio_storage="50Gi" minio_cpu="500m" minio_mem="1Gi"
+    local sc_field=""
+    [ -n "$storage_class" ] && sc_field="        storageClassName: ${storage_class}"
+
+    # Three dots in '{0...3}' is required by MinIO's own ellipsis syntax for server pools. Two dots
+    # gets shell-expanded locally by the container's entrypoint and breaks erasure-set ordering.
+    local minio_endpoint="http://${release}-minio-{0...3}.${release}-minio-headless.${ns}.svc.cluster.local/data"
+
+    kubectl apply -n "$ns" -f - <<EOF || return 1
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${release}-minio-headless
+  labels: {app: ${release}-minio}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: ${release}-minio}
+  ports: [{name: api, port: 9000, targetPort: 9000}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${release}-minio
+  labels: {app: ${release}-minio}
+spec:
+  selector: {app: ${release}-minio}
+  ports: [{name: api, port: 9000, targetPort: 9000}, {name: console, port: 9001, targetPort: 9001}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${release}-minio
+  labels: {app: ${release}-minio}
+spec:
+  serviceName: ${release}-minio-headless
+  replicas: 4
+  selector:
+    matchLabels: {app: ${release}-minio}
+  template:
+    metadata:
+      labels: {app: ${release}-minio}
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+          args: ["server", "${minio_endpoint}", "--console-address", ":9001"]
+          ports: [{containerPort: 9000}, {containerPort: 9001}]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: ${release}-datastore-minio, key: rootUser}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: ${release}-datastore-minio, key: rootPassword}}
+          resources:
+            requests: {cpu: ${minio_cpu}, memory: ${minio_mem}}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+          readinessProbe:
+            httpGet: {path: /minio/health/ready, port: 9000}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+${sc_field}
+        resources: {requests: {storage: ${minio_storage}}}
+EOF
+
+    _saas_log_wait "Waiting for the 4-node MinIO cluster to be ready…"
+    kubectl -n "$ns" rollout status statefulset "${release}-minio" --timeout=300s || return 1
+
+    _saas_gitlab_datastore_init_buckets "$ns" "$release" || return 1
+    _saas_log_ok "MinIO (4-node distributed) ready."
+}
+
 # _saas_gitlab_datastore_init_buckets NAMESPACE RELEASE
 # Ephemeral job with 'mc' that (idempotently) creates the buckets global.appConfig.object_store expects from the chart.
 _saas_gitlab_datastore_init_buckets() {
@@ -270,6 +383,7 @@ EOF
 }
 
 # _saas_gitlab_datastore_delete NAMESPACE RELEASE
+# --mode dev only (see datastore-ha.sh for --mode prod).
 _saas_gitlab_datastore_delete() {
     local ns="$1" release="$2"
     kubectl -n "$ns" delete statefulset,deployment,service,configmap,job \

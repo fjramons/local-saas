@@ -1,6 +1,6 @@
-# --- GitLab Runner (Kubernetes executor) for 'saas gitlab' — integrated into 'install'. Registration no longer uses "registration tokens" (deprecated): a 'root' Personal Access Token is minted via 'gitlab-rails runner' in the toolbox pod, and it's used to request a runner authentication token (glrt-…) from the POST /user/runners API — the same flow GitLab documents for automating runner creation.
+# --- GitLab Runner (Kubernetes executor) for 'saas gitlab', integrated into 'install'. Registration no longer uses "registration tokens" (deprecated): a 'root' Personal Access Token is minted via 'gitlab-rails runner' in the toolbox pod, and it's used to request a runner authentication token (glrt-…) from the POST /user/runners API, the same flow GitLab documents for automating runner creation.
 #
-# The runner (and the initial registration) use the configured PUBLIC domain (global.hosts.domain), not an internal Service — verified in practice that it has to be this way: GitLab always uses that same domain as CI_SERVER_URL/repo_url for the 'git clone' each CI job does inside its own pod, so even if the runner itself could talk to an internal Service, the jobs would still try to resolve the public domain. That's why that domain has to genuinely resolve FROM INSIDE the cluster (see '_saas_gitlab_cluster_patch_coredns' in cluster.sh, which in --cluster-mode kind points the domain at ingress-nginx's ClusterIP), and with --tls self-signed, the runner additionally needs to trust our self-signed CA (--set certsSecretName, see below) — without both at once the job fails with "Could not resolve host" or a TLS error.
+# The runner (and the initial registration) use the configured PUBLIC domain (global.hosts.domain), not an internal Service. Verified in practice that it has to be this way: GitLab always uses that same domain as CI_SERVER_URL/repo_url for the 'git clone' each CI job does inside its own pod, so even if the runner itself could talk to an internal Service, the jobs would still try to resolve the public domain. That's why that domain has to genuinely resolve FROM INSIDE the cluster (see '_saas_gitlab_cluster_patch_coredns' in cluster.sh, which in --cluster-mode kind points the domain at ingress-nginx's ClusterIP), and with --tls self-signed, the runner additionally needs to trust our self-signed CA (--set certsSecretName, see below). Without both at once the job fails with "Could not resolve host" or a TLS error.
 
 _SAAS_GITLAB_RUNNER_HELM_REPO_NAME="gitlab"
 
@@ -26,7 +26,7 @@ end
 }
 
 # _saas_gitlab_runner_register NAMESPACE RELEASE DOMAIN
-# Prints the runner authentication token (glrt-…) to stdout. -k: the ephemeral pod making this one call has no need to trust the self-signed CA (unlike the runner/jobs, which need to persistently — see certsSecretName in _saas_gitlab_runner_install).
+# Prints the runner authentication token (glrt-…) to stdout. -k: the ephemeral pod making this one call has no need to trust the self-signed CA (unlike the runner/jobs, which need to persistently, see certsSecretName in _saas_gitlab_runner_install).
 _saas_gitlab_runner_register() {
     local ns="$1" release="$2" domain="$3"
     local pat
