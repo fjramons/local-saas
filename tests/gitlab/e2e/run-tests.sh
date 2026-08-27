@@ -24,13 +24,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 RELEASE="saase2e"
 KEEP=false
 ONLY=""
+# Pinned like every other test/runtime image in this repo (see CLAUDE.md, "Pinned versions"); the
+# 'debug' variant is a busybox-based image with a shell, needed to chain 'crane auth login' and the
+# actual push/pull in one container invocation. Verified against ghcr.io/gcr.io at time of writing.
+CRANE_IMAGE="gcr.io/go-containerregistry/crane/debug:v0.22.0"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --keep) KEEP=true; shift ;;
         --only) ONLY="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--keep] [--only dev-install|registry|pages|duckdns|up-down|ssh-config|prod-ha|pages-subdomain]"
+            echo "Usage: $0 [--keep] [--only dev-install|registry-push-pull|reinstall|registry|pages|duckdns|up-down|ssh-config|prod-ha|pages-subdomain]"
             exit 0
             ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -56,6 +60,65 @@ _e2e_curl_in_cluster() {
     kubectl -n "$ns" wait --for=jsonpath='{.status.phase}'=Succeeded --timeout=30s "pod/$pod" >/dev/null 2>&1
     kubectl -n "$ns" logs "$pod" 2>/dev/null
     kubectl -n "$ns" delete pod "$pod" --ignore-not-found >/dev/null 2>&1
+}
+
+# _e2e_registry_ca NAMESPACE RELEASE OUT_FILE
+# Extracts the release's self-signed cert into OUT_FILE, the same Secret 'saas gitlab credentials'
+# already documents for real users (credentials.sh) to trust it. Fails if empty/missing.
+_e2e_registry_ca() {
+    local ns="$1" release="$2" out="$3"
+    kubectl -n "$ns" get secret "${release}-gitlab-tls" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "$out"
+    [ -s "$out" ]
+}
+
+# _e2e_crane WORKDIR REGISTRY_HOST DOMAIN ROOT_PASSWORD CRANE_COMMAND
+# Runs a throwaway 'crane' container FROM THE HOST (--network host + --add-host, no /etc/hosts or
+# Docker daemon changes), exactly like a real remote 'docker pull' would reach the kind-exposed
+# hostPort. Deliberately not an in-cluster pod: a pod inside the cluster can already reach MinIO's
+# ClusterIP directly either way, so only a client outside the pod network actually exercises
+# 'redirect.disable' (datastore.sh). Needs BOTH hostnames resolvable, not just REGISTRY_HOST:
+# reproduced live that GitLab's registry auth flow (401 on /v2/ -> Www-Authenticate: Bearer
+# realm="https://DOMAIN/jwt/auth") sends the client to fetch its bearer token from the MAIN domain,
+# not the registry subdomain. TLS trust comes from WORKDIR/ca.crt (see _e2e_registry_ca) via
+# SSL_CERT_FILE, not from installing anything into the host's real trust store. Output (both
+# 'auth login' and CRANE_COMMAND) is appended to WORKDIR/crane.log for post-mortem on failure.
+_e2e_crane() {
+    local work_dir="$1" registry_host="$2" domain="$3" root_password="$4" cmd="$5"
+    docker run --rm --network host \
+        --add-host "${registry_host}:127.0.0.1" \
+        --add-host "${domain}:127.0.0.1" \
+        -e SSL_CERT_FILE=/work/ca.crt \
+        -v "$work_dir:/work" \
+        --entrypoint sh "$CRANE_IMAGE" \
+        -c "crane auth login '$registry_host' -u root -p '$root_password' && $cmd" \
+        >>"$work_dir/crane.log" 2>&1
+    local status=$?
+    [ "$status" -eq 0 ] || cat "$work_dir/crane.log"
+    return "$status"
+}
+
+# _e2e_registry_ensure_project NAMESPACE RELEASE
+# GitLab's Container Registry authorizes a push/pull only against a repository path that maps to a
+# REAL project (reproduced live: pushing to a made-up path like 'registry/e2e-smoke' 401s even with
+# valid credentials, "authentication required", since the JWT auth service has nothing to check
+# scope against). Creates 'root/e2e-smoke' if missing, via 'gitlab-rails runner' in the toolbox pod,
+# the same bootstrap pattern '_saas_gitlab_runner_mint_root_pat' (runner.sh) already uses.
+_e2e_registry_ensure_project() {
+    local ns="$1" release="$2"
+    local toolbox_pod
+    toolbox_pod="$(kubectl -n "$ns" get pods -o name 2>/dev/null | grep -m1 "${release}-toolbox" | sed 's#^pod/##')"
+    [ -n "$toolbox_pod" ] || return 1
+
+    local script='
+u = User.find_by_username("root")
+p = Project.find_by_full_path("root/e2e-smoke")
+unless p
+  p = ::Projects::CreateService.new(u, name: "e2e-smoke", path: "e2e-smoke", visibility_level: Gitlab::VisibilityLevel::PRIVATE, container_registry_enabled: true).execute
+  raise p.errors.full_messages.join(", ") unless p.persisted?
+end
+puts p.full_path
+'
+    kubectl -n "$ns" exec "$toolbox_pod" -- gitlab-rails runner "$script" 2>/dev/null | grep -qx "root/e2e-smoke"
 }
 
 if ! command -v kind_cluster >/dev/null 2>&1 && [ -n "${KIND_CLUSTER_FUNCTIONS:-}" ]; then
@@ -110,6 +173,97 @@ if run_phase dev-install; then
     else
         fail "GitLab Runner deployed"
     fi
+fi
+
+# ------------------------------------------------------------------
+# Phase: registry-push-pull (depends on 'dev-install'; a REAL image push+pull against the Container
+# Registry, from OUTSIDE the cluster's pod network, see _e2e_crane above. This is what actually
+# exercises 'pathstyle'/'checksum_disabled'/'redirect.disable' on the registry's S3 storage config
+# against MinIO (datastore.sh); the 'registry' phase below only proves the API is reachable, not
+# that a real push/pull works end to end.)
+# ------------------------------------------------------------------
+if run_phase registry-push-pull; then
+    echo "=== Phase: registry-push-pull ==="
+    _saas_gitlab_state_load "$RELEASE" 2>/dev/null || { fail "registry-push-pull: no saved state (did you run 'dev-install' first?)"; }
+
+    ns="${SAAS_GITLAB_STATE_NAMESPACE:-$RELEASE}"
+    domain="${SAAS_GITLAB_STATE_DOMAIN:-}"
+    registry_host="registry.${domain}"
+    image_ref="${registry_host}/root/e2e-smoke:latest"
+    work_dir="$(mktemp -d "${TMPDIR:-/tmp}/saas-e2e-registry-XXXXXX")"
+
+    if ! _e2e_registry_ensure_project "$ns" "$RELEASE"; then
+        fail "registry-push-pull: could not create the 'root/e2e-smoke' project to push into"
+    elif _e2e_registry_ca "$ns" "$RELEASE" "$work_dir/ca.crt"; then
+        tar cf "$work_dir/layer.tar" -C "$REPO_ROOT" README.md
+
+        if _e2e_crane "$work_dir" "$registry_host" "$domain" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" \
+            "crane append -f /work/layer.tar -t '$image_ref' --oci-empty-base"; then
+            pass "crane push of a real image to the Container Registry from outside the cluster succeeds"
+        else
+            fail "crane push of a real image to the Container Registry from outside the cluster succeeds (see $work_dir/crane.log)"
+        fi
+
+        if _e2e_crane "$work_dir" "$registry_host" "$domain" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" \
+            "crane pull '$image_ref' /work/pulled.tar" && [ -s "$work_dir/pulled.tar" ]; then
+            pass "crane pull of the same image from outside the cluster succeeds"
+        else
+            fail "crane pull of the same image from outside the cluster succeeds (see $work_dir/crane.log)"
+        fi
+    else
+        fail "registry-push-pull: could not extract the self-signed CA from ${RELEASE}-gitlab-tls"
+    fi
+    rm -rf "$work_dir"
+fi
+
+# ------------------------------------------------------------------
+# Phase: reinstall (depends on 'dev-install' AND 'registry-push-pull': re-runs 'saas gitlab install'
+# a SECOND time against the already-provisioned $RELEASE, the exact scenario Bug 1 fixed (install
+# used to regenerate PostgreSQL/MinIO/root/Redis credentials on every call, even against a live
+# release, desyncing them from the already-running pods, see install.sh). Confirms the four
+# credentials are byte-identical before/after, and re-pulls the image pushed above: the real
+# functional proof that the MinIO credentials baked into the registry's storage Secret are still the
+# ones the already-running MinIO pod actually accepts, not just that the state file's password
+# string didn't change.
+# ------------------------------------------------------------------
+if run_phase reinstall; then
+    echo "=== Phase: reinstall ==="
+    _saas_gitlab_state_load "$RELEASE" 2>/dev/null || { fail "reinstall: no saved state (did you run 'dev-install' first?)"; }
+
+    ns="${SAAS_GITLAB_STATE_NAMESPACE:-$RELEASE}"
+    psql_before="$SAAS_GITLAB_STATE_PSQL_PASSWORD"
+    minio_user_before="$SAAS_GITLAB_STATE_MINIO_ROOT_USER"
+    minio_password_before="$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD"
+    root_password_before="$SAAS_GITLAB_STATE_ROOT_PASSWORD"
+
+    if saas gitlab install --release "$RELEASE" --cluster-mode kind --mode dev \
+        --tls self-signed --kind-workers 0 --pages --non-interactive -y; then
+        pass "a second 'install' against the already-provisioned release succeeds"
+    else
+        fail "a second 'install' against the already-provisioned release succeeds"
+    fi
+
+    _saas_gitlab_state_load "$RELEASE"
+    [ "$SAAS_GITLAB_STATE_PSQL_PASSWORD" = "$psql_before" ] && pass "reinstall: PSQL_PASSWORD unchanged" || fail "reinstall: PSQL_PASSWORD unchanged"
+    [ "$SAAS_GITLAB_STATE_MINIO_ROOT_USER" = "$minio_user_before" ] && pass "reinstall: MINIO_ROOT_USER unchanged" || fail "reinstall: MINIO_ROOT_USER unchanged"
+    [ "$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" = "$minio_password_before" ] && pass "reinstall: MINIO_ROOT_PASSWORD unchanged" || fail "reinstall: MINIO_ROOT_PASSWORD unchanged"
+    [ "$SAAS_GITLAB_STATE_ROOT_PASSWORD" = "$root_password_before" ] && pass "reinstall: ROOT_PASSWORD unchanged" || fail "reinstall: ROOT_PASSWORD unchanged"
+
+    status_code="$(curl -sk -o /dev/null -w '%{http_code}' -H "Host: $SAAS_GITLAB_STATE_DOMAIN" "https://localhost/users/sign_in")"
+    [[ "$status_code" =~ ^(200|302)$ ]] && pass "after reinstall, the ingress still serves /users/sign_in" || fail "after reinstall, the ingress still serves /users/sign_in (HTTP $status_code)"
+
+    registry_host="registry.${SAAS_GITLAB_STATE_DOMAIN}"
+    image_ref="${registry_host}/root/e2e-smoke:latest"
+    work_dir="$(mktemp -d "${TMPDIR:-/tmp}/saas-e2e-reinstall-XXXXXX")"
+
+    if _e2e_registry_ca "$ns" "$RELEASE" "$work_dir/ca.crt" \
+        && _e2e_crane "$work_dir" "$registry_host" "$SAAS_GITLAB_STATE_DOMAIN" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" "crane pull '$image_ref' /work/pulled.tar" \
+        && [ -s "$work_dir/pulled.tar" ]; then
+        pass "the image pushed earlier is still pullable after reinstall (MinIO auth intact)"
+    else
+        fail "the image pushed earlier is still pullable after reinstall (MinIO auth intact, see $work_dir/crane.log)"
+    fi
+    rm -rf "$work_dir"
 fi
 
 # ------------------------------------------------------------------

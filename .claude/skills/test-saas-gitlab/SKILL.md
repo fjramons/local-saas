@@ -13,19 +13,21 @@ This repo has two test tiers for `services/gitlab/`:
 ## What the E2E suite checks
 
 1. **dev-install**: a real `saas gitlab install --cluster-mode kind --mode dev --tls self-signed --pages --non-interactive -y` (`--registry` is on by default). Checks that `curl` against the ingress with the right `Host` header responds 200/302 (not just that the command doesn't fail), that `saas gitlab credentials` prints a real password, and that the `gitlab-runner` `Deployment` ends up with ready replicas.
-2. **registry**: depends on `dev-install`. Checks the Container Registry API responds at `registry.<domain>/v2/` from inside the cluster.
-3. **pages**: depends on `dev-install` having installed with `--pages`. Checks the `gitlab-pages` `Deployment` has ready replicas and `pages.<domain>/` is reachable (any HTTP response, even 404, proves it's not connection-refused).
-4. **duckdns**: independent, does NOT attempt real ACME issuance (no real DuckDNS account/domain in CI). Installs the `cert-manager-webhook-duckdns` Helm release with a dummy token and checks its `Deployment` and `APIService` come up healthy. Full DNS-01 issuance against a real DuckDNS account can only be verified manually.
-5. **up-down**: runs `saas gitlab down` (destroys the cluster) followed by `saas gitlab up` (recreates it) on the `dev-install` release, and checks that the `root` password persisted in the state is the SAME before and after (the real proof that the cycle doesn't break credentials against data that's already persisted, see CLAUDE.md, "We have to set the initial root password ourselves") and that the ingress serves traffic again after `up`.
-6. **ssh-config**: checks that `saas gitlab ssh-config` prints the right block and that the SSH port exposed on the host accepts connections.
-7. **prod-ha** (**opt-in only**, `--only prod-ha`, never part of the default full-suite run: 3x CNPG PostgreSQL + 3x Redis/Sentinel + 4x MinIO + the full `prod` GitLab baseline is too heavy for most laptops/CI runners): installs a SEPARATE release (`saase2eha`) with `--mode prod --tls self-signed --force-self-signed-prod`, checks the CloudNativePG `Cluster` reaches 3 instances, `RedisReplication`/`RedisSentinel` are Ready, the MinIO `StatefulSet` reaches 4 ready replicas, and the ingress serves traffic, then deletes itself.
+2. **registry-push-pull**: depends on `dev-install`. A REAL image push and pull against the Container Registry, from a throwaway `crane` container run on the HOST (`--network host`, not an in-cluster pod), exercising `pathstyle`/`checksum_disabled`/`redirect.disable` on the registry's S3 storage config end to end, not just that `/v2/` answers. An in-cluster client wouldn't catch a `redirect.disable` regression, since it can already reach MinIO's ClusterIP directly either way.
+3. **reinstall**: depends on `dev-install` and `registry-push-pull`. Re-runs `saas gitlab install` a SECOND time against the already-provisioned release (not `up`, a different code path already covered by `up-down` below) and checks PostgreSQL/MinIO/root credentials stay byte-identical, then re-pulls the image pushed in `registry-push-pull` as functional proof the MinIO credentials baked into the registry's storage Secret still actually work.
+4. **registry**: depends on `dev-install`. Checks the Container Registry API responds at `registry.<domain>/v2/` from inside the cluster.
+5. **pages**: depends on `dev-install` having installed with `--pages`. Checks the `gitlab-pages` `Deployment` has ready replicas and `pages.<domain>/` is reachable (any HTTP response, even 404, proves it's not connection-refused).
+6. **duckdns**: independent, does NOT attempt real ACME issuance (no real DuckDNS account/domain in CI). Installs the `cert-manager-webhook-duckdns` Helm release with a dummy token and checks its `Deployment` and `APIService` come up healthy. Full DNS-01 issuance against a real DuckDNS account can only be verified manually.
+7. **up-down**: runs `saas gitlab down` (destroys the cluster) followed by `saas gitlab up` (recreates it) on the `dev-install` release, and checks that the `root` password persisted in the state is the SAME before and after (the real proof that the cycle doesn't break credentials against data that's already persisted, see CLAUDE.md, "We have to set the initial root password ourselves") and that the ingress serves traffic again after `up`.
+8. **ssh-config**: checks that `saas gitlab ssh-config` prints the right block and that the SSH port exposed on the host accepts connections.
+9. **prod-ha** (**opt-in only**, `--only prod-ha`, never part of the default full-suite run: 3x CNPG PostgreSQL + 3x Redis/Sentinel + 4x MinIO + the full `prod` GitLab baseline is too heavy for most laptops/CI runners): installs a SEPARATE release (`saase2eha`) with `--mode prod --tls self-signed --force-self-signed-prod`, checks the CloudNativePG `Cluster` reaches 3 instances, `RedisReplication`/`RedisSentinel` are Ready, the MinIO `StatefulSet` reaches 4 ready replicas, and the ingress serves traffic, then deletes itself.
 
-`registry`/`pages`/`up-down`/`ssh-config` depend on `dev-install` having left the release alive. Either run the full suite, or `--only dev-install --keep` before launching just one of them.
+`registry-push-pull`/`reinstall`/`registry`/`pages`/`up-down`/`ssh-config` depend on `dev-install` having left the release alive. Either run the full suite, or `--only dev-install --keep` before launching just one of them (`reinstall` also needs `registry-push-pull --keep` to have run first in the same release, for the image it re-pulls to exist).
 
 ## Prerequisites
 
 - `kind`, `docker`, `kubectl`, `helm`, `jq`, `envsubst`, `curl` installed.
-- Docker running.
+- Docker running (also used directly by `registry-push-pull`/`reinstall` to run a throwaway, pinned `crane` container from the host; no host-level Docker config changes, no sudo).
 - `kind_cluster` (`bash-aliases` repo) reachable: nothing to do if your shell already has it loaded; otherwise pass `KIND_CLUSTER_FUNCTIONS`:
   ```bash
   KIND_CLUSTER_FUNCTIONS=/path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh \
@@ -40,7 +42,7 @@ This repo has two test tiers for `services/gitlab/`:
 ```bash
 bash tests/gitlab/unit/test-argparse-values.sh
 
-bash tests/gitlab/e2e/run-tests.sh                    # full suite (dev-install, registry, pages, duckdns, up-down, ssh-config)
+bash tests/gitlab/e2e/run-tests.sh                    # full suite (dev-install, registry-push-pull, reinstall, registry, pages, duckdns, up-down, ssh-config)
 bash tests/gitlab/e2e/run-tests.sh --only dev-install  # a single phase
 bash tests/gitlab/e2e/run-tests.sh --keep              # don't tear down at the end, for inspection
 bash tests/gitlab/e2e/run-tests.sh --only prod-ha      # opt-in, heavy: HA datastore only, run deliberately

@@ -356,10 +356,26 @@ _saas_gitlab_install() {
         storage_class="$(_saas_gitlab_resolve_storage_class "$storage_class" "$non_interactive")" || return 1
     fi
 
+    # Reuse existing credentials on a re-install against an already-provisioned release: the
+    # chart's Secrets would otherwise be overwritten with fresh random values while the already-
+    # running PostgreSQL/MinIO/Redis pods keep their original ones baked into their own env vars
+    # (Kubernetes doesn't restart a pod just because the Secret it reads from changed), breaking
+    # auth against those datastores. Mirrors what "up"'s own call site below already does;
+    # "install" was the one path that skipped this.
+    local psql_password="" minio_user="" minio_password="" root_password="" redis_password=""
+    if _saas_gitlab_state_load "$release"; then
+        psql_password="$SAAS_GITLAB_STATE_PSQL_PASSWORD"
+        minio_user="$SAAS_GITLAB_STATE_MINIO_ROOT_USER"
+        minio_password="$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD"
+        root_password="$SAAS_GITLAB_STATE_ROOT_PASSWORD"
+        redis_password="$SAAS_GITLAB_STATE_REDIS_PASSWORD"
+    fi
+
     _saas_gitlab_provision "$release" "$namespace" "$cluster_mode" "$kind_name" "$kind_workers" \
         "$storage_mode" "$storage_class" "$mode" "$version" "$domain" "$tls" "$issuer_name" \
         "$challenge" "$dns_provider" "$dns_token" "$email" "$ingress_class" "$ssh_host_port" \
-        "$runner_enabled" "$registry_enabled" "$pages_enabled" "$pages_url_mode" "" "" "" "" ""
+        "$runner_enabled" "$registry_enabled" "$pages_enabled" "$pages_url_mode" \
+        "$psql_password" "$minio_user" "$minio_password" "$root_password" "$redis_password"
 }
 
 # _saas_gitlab_provision RELEASE NAMESPACE CLUSTER_MODE KIND_NAME KIND_WORKERS \

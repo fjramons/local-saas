@@ -65,6 +65,25 @@ EOF
     # (verified against the chart's own values.yaml). It needs its own 'registry.storage.secret', a
     # Secret whose 'config' key is the registry's native S3 driver config, spliced into its config.yml at
     # startup. Created unconditionally (cheap, harmless if --registry is off), same precedent as .s3cfg above.
+    #
+    # checksum_disabled: true is required against MinIO: GitLab's registry always uses its AWS
+    # SDK v2 based S3 driver internally (DriverName s3_v2 in its own logs) even though this config
+    # still uses the 's3' key, not 's3_v2'. That SDK sends a CRC64NVME checksum by default on
+    # multipart UploadPartCopy requests, which MinIO rejects with "InvalidArgument: checksum
+    # missing", failing every push. This is GitLab's own documented fix for S3-compatible backends
+    # (Ceph, MinIO, etc.). Known limitation from that same guidance: a push that triggers a blob
+    # deletion (DeleteObjects) can still fail, since GitLab has no equivalent config knob for it.
+    #
+    # pathstyle: true is GitLab's own documented recommendation for MinIO/Ceph RGW/most
+    # S3-compatible backends, kept regardless of whether it fixes any specific observed failure.
+    #
+    # redirect.disable: true: without it, the registry answers blob (image layer) requests with a
+    # 302 straight to MinIO's own in-cluster Service address, a ClusterIP unreachable from outside
+    # the cluster (manifest/auth resolve fine over the public ingress; only the blob download
+    # fails). Disabling redirect makes the registry proxy blob bytes through itself instead,
+    # GitLab's documented setting for registries with no public storage backend. The "worse
+    # performance, less attack surface" tradeoff GitLab's own docs mention is a non-issue for a
+    # local dev registry at this scale.
     local registry_storage
     registry_storage="$(cat <<EOF
 s3:
@@ -75,6 +94,10 @@ s3:
   accesskey: ${minio_user}
   secretkey: ${minio_password}
   secure: false
+  pathstyle: true
+  checksum_disabled: true
+redirect:
+  disable: true
 EOF
 )"
     kubectl -n "$ns" create secret generic "${release}-datastore-registry-storage" \
