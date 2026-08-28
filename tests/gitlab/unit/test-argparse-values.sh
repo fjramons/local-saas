@@ -16,10 +16,14 @@ source "$REPO_ROOT/services/gitlab/lib/state.sh"
 source "$REPO_ROOT/services/gitlab/lib/cluster.sh"
 source "$REPO_ROOT/services/gitlab/lib/versions.sh"
 source "$REPO_ROOT/services/gitlab/lib/operators.sh"
+source "$REPO_ROOT/services/gitlab/lib/datastore.sh"
 source "$REPO_ROOT/services/gitlab/lib/tls.sh"
 source "$REPO_ROOT/services/gitlab/lib/ssh.sh"
 source "$REPO_ROOT/services/gitlab/lib/credentials.sh"
 source "$REPO_ROOT/services/gitlab/lib/install.sh"
+source "$REPO_ROOT/services/gitlab/lib/token.sh"
+source "$REPO_ROOT/services/gitlab/lib/runner.sh"
+source "$REPO_ROOT/services/gitlab/lib/doctor.sh"
 
 export SAAS_GITLAB_STATE_DIR
 SAAS_GITLAB_STATE_DIR="$(mktemp -d)"
@@ -343,6 +347,138 @@ _saas_gitlab_operator_duckdns_webhook_ensure "dummy-token" >/dev/null 2>&1
 [ "$_TEST_HELM_CALLS" -eq 0 ] && pass "operators: already-present CNPG/redis-operator/duckdns-webhook skip 'helm upgrade --install'" \
     || fail "operators: already-present CNPG/redis-operator/duckdns-webhook skip 'helm upgrade --install' (got $_TEST_HELM_CALLS calls)"
 unset -f kubectl helm
+
+# ------------------------------------------------------------------
+# credentials.sh: --verify is opt-in and degrades gracefully when the toolbox pod can't be reached.
+# ------------------------------------------------------------------
+_saas_gitlab_state_save "credtest" "RELEASE=credtest" "NAMESPACE=credns" "DOMAIN=credtest.gitlab.local" "ROOT_PASSWORD=rootpw123" "TLS=self-signed" "CLUSTER_MODE=existing"
+out="$(_saas_gitlab_credentials credtest 2>&1)"
+echo "$out" | grep -q "rootpw123" && pass "credentials: plain call (no --verify) still prints the password" || fail "credentials: plain call (no --verify) still prints the password"
+echo "$out" | grep -qi "verif" && fail "credentials: plain call doesn't attempt verification" || pass "credentials: plain call doesn't attempt verification"
+
+kubectl() { return 1; }
+out="$(_saas_gitlab_credentials credtest --verify 2>&1)"
+echo "$out" | grep -qi "could not verify" && pass "credentials --verify: reports gracefully when the toolbox pod is unreachable" || fail "credentials --verify: reports gracefully when the toolbox pod is unreachable (got: $out)"
+unset -f kubectl
+_saas_gitlab_state_delete "credtest"
+
+# ------------------------------------------------------------------
+# token.sh: mint scope/expiry building + dispatch, no real cluster.
+# ------------------------------------------------------------------
+_saas_gitlab_valid_token_username "root" && pass "valid_token_username accepts 'root'" || fail "valid_token_username accepts 'root'"
+_saas_gitlab_valid_token_username "a b" && fail "valid_token_username rejects a space" || pass "valid_token_username rejects a space"
+_saas_gitlab_valid_token_scopes "api" && pass "valid_token_scopes accepts a single scope" || fail "valid_token_scopes accepts a single scope"
+_saas_gitlab_valid_token_scopes "api,create_runner" && pass "valid_token_scopes accepts a comma-separated list" || fail "valid_token_scopes accepts a comma-separated list"
+_saas_gitlab_valid_token_scopes "api," && fail "valid_token_scopes rejects a trailing comma" || pass "valid_token_scopes rejects a trailing comma"
+
+# $(...) below runs in a subshell, so the captured script must go to a real FILE (a plain variable
+# assigned inside the mocked kubectl would be lost the moment that subshell exits), same reasoning
+# as _TEST_COREFILE_FILE above.
+_TEST_TOKEN_SCRIPT_FILE="$(mktemp)"
+kubectl() {
+    case "$*" in
+        "-n toolboxns get pods -o name")
+            echo "pod/tokentest-toolbox-abc123"
+            ;;
+        "-n toolboxns exec tokentest-toolbox-abc123 -- gitlab-rails runner "*)
+            local _joined="$*"
+            printf '%s' "${_joined#*-- gitlab-rails runner }" > "$_TEST_TOKEN_SCRIPT_FILE"
+            echo "glpat-faketoken123"
+            ;;
+    esac
+}
+_saas_gitlab_state_save "tokentest" "RELEASE=tokentest" "NAMESPACE=toolboxns"
+out="$(_saas_gitlab_token_mint tokentest root api,create_runner 7 2>/dev/null)"
+[ "$out" = "glpat-faketoken123" ] && pass "token mint: prints the minted token to stdout" || fail "token mint: prints the minted token to stdout (got '$out')"
+_test_token_script="$(cat "$_TEST_TOKEN_SCRIPT_FILE")"
+echo "$_test_token_script" | grep -qF "find_by_username('root')" && pass "token mint: script targets the given username" || fail "token mint: script targets the given username (got: $_test_token_script)"
+echo "$_test_token_script" | grep -qF '["api", "create_runner"]' && pass "token mint: script builds the scopes array from the comma-separated list" || fail "token mint: script builds the scopes array (got: $(echo "$_test_token_script" | grep scopes))"
+echo "$_test_token_script" | grep -qF "7.days.from_now" && pass "token mint: script uses the given expiry" || fail "token mint: script uses the given expiry"
+rm -f "$_TEST_TOKEN_SCRIPT_FILE"
+_saas_gitlab_token_mint tokentest "bad user" >/dev/null 2>&1 && fail "token mint: rejects an invalid username" || pass "token mint: rejects an invalid username"
+_saas_gitlab_state_delete "tokentest"
+unset -f kubectl
+
+# ------------------------------------------------------------------
+# doctor.sh: pure '_check_*' functions, mocked kubectl/docker, no real cluster.
+# ------------------------------------------------------------------
+
+# A. Pod health: only "Unknown"-phase pods are reported.
+kubectl() {
+    case "$*" in
+        "-n doctorns get pods -o json")
+            cat <<'JSON'
+{"items":[{"metadata":{"name":"pod-a"},"status":{"phase":"Running"}},{"metadata":{"name":"pod-b"},"status":{"phase":"Unknown"}}]}
+JSON
+            ;;
+    esac
+}
+out="$(_saas_gitlab_doctor_check_pods doctorns)"
+[ "$out" = "pod-b" ] && pass "doctor check_pods: reports only the Unknown-phase pod" || fail "doctor check_pods: reports only the Unknown-phase pod (got '$out')"
+unset -f kubectl
+
+# B. PostgreSQL password: ok / mismatch / unreachable.
+kubectl() {
+    case "$*" in
+        "-n doctorns get pod demo-postgresql-0") return 0 ;;
+        "-n doctorns exec demo-postgresql-0 -- env PGPASSWORD=rightpw psql -U gitlab -d gitlabhq_production -tAc SELECT 1") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+[ "$(_saas_gitlab_doctor_check_psql doctorns demo rightpw)" = "ok" ] && pass "doctor check_psql: 'ok' when the password authenticates" || fail "doctor check_psql: 'ok' when the password authenticates"
+[ "$(_saas_gitlab_doctor_check_psql doctorns demo wrongpw)" = "mismatch" ] && pass "doctor check_psql: 'mismatch' when it doesn't" || fail "doctor check_psql: 'mismatch' when it doesn't"
+unset -f kubectl
+
+kubectl() { return 1; }
+[ "$(_saas_gitlab_doctor_check_psql doctorns demo anypw)" = "unreachable" ] && pass "doctor check_psql: 'unreachable' when the pod doesn't exist" || fail "doctor check_psql: 'unreachable' when the pod doesn't exist"
+unset -f kubectl
+
+# C. MinIO secret drift: the running pod's password is the source of truth; only a genuinely stale
+# Secret is flagged, matching ones are not.
+_TEST_MINIO_REAL_PW="realpw123"
+kubectl() {
+    case "$*" in
+        "-n doctorns get pods -l app=demo-minio -o name")
+            echo "pod/demo-minio-xyz"
+            ;;
+        "-n doctorns exec demo-minio-xyz -- printenv MINIO_ROOT_PASSWORD")
+            echo "$_TEST_MINIO_REAL_PW"
+            ;;
+        "-n doctorns get secret demo-datastore-minio -o jsonpath={.data.rootPassword}")
+            printf '%s' "$_TEST_MINIO_REAL_PW" | base64
+            ;;
+        "-n doctorns get secret demo-datastore-registry-storage -o jsonpath={.data.config}")
+            printf 's3:\n  secretkey: staleval\n' | base64
+            ;;
+        "-n doctorns get secret demo-datastore-s3cfg -o jsonpath={.data.config}")
+            printf 'secret_key = %s\n' "$_TEST_MINIO_REAL_PW" | base64
+            ;;
+        "-n doctorns get secret demo-datastore-objectstore -o jsonpath={.data.connection}")
+            printf 'aws_secret_access_key: %s\n' "$_TEST_MINIO_REAL_PW" | base64
+            ;;
+    esac
+}
+out="$(_saas_gitlab_doctor_check_minio doctorns demo)"
+first_line="$(echo "$out" | head -n1)"
+rest="$(echo "$out" | tail -n +2)"
+[ "$first_line" = "$_TEST_MINIO_REAL_PW" ] && pass "doctor check_minio: first line is the pod's real password" || fail "doctor check_minio: first line is the pod's real password (got '$first_line')"
+echo "$rest" | grep -qx "demo-datastore-registry-storage" && pass "doctor check_minio: flags the stale registry-storage Secret" || fail "doctor check_minio: flags the stale registry-storage Secret (got: $rest)"
+echo "$rest" | grep -qx "demo-datastore-minio" && fail "doctor check_minio: does not flag a matching Secret" || pass "doctor check_minio: does not flag a matching Secret"
+echo "$rest" | grep -qx "demo-datastore-s3cfg" && fail "doctor check_minio: does not flag a matching s3cfg Secret" || pass "doctor check_minio: does not flag a matching s3cfg Secret"
+unset -f kubectl
+
+# D. kind-expose SSH proxy: detected via the same 'kind-cluster.expose.*' labels the proxy itself is
+# created with (_kind_cluster_expose_add, sibling bash-aliases repo).
+docker() {
+    case "$*" in
+        "ps --filter label=kind-cluster.expose.cluster=mycluster --filter label=kind-cluster.expose.hostport=2222 --filter label=kind-cluster.expose.protocol=tcp --format {{.Names}}")
+            echo "kind-expose-mycluster-2222-tcp"
+            ;;
+    esac
+}
+_saas_gitlab_doctor_check_expose "mycluster" "2222" && pass "doctor check_expose: detects a running proxy" || fail "doctor check_expose: detects a running proxy"
+_saas_gitlab_doctor_check_expose "mycluster" "9999" && fail "doctor check_expose: doesn't detect a proxy on a different port" || pass "doctor check_expose: doesn't detect a proxy on a different port"
+unset -f docker
 
 # ------------------------------------------------------------------
 # Summary

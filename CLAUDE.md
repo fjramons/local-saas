@@ -18,8 +18,10 @@ Technical guide for working in this repo. README.md is the usage-oriented entry 
 | `services/gitlab/lib/tls.sh` | cert-manager, `ClusterIssuer`/`Certificate` |
 | `services/gitlab/lib/install.sh` | `install`/`up`/`down`/`delete`/`status`: full orchestration |
 | `services/gitlab/lib/runner.sh` | GitLab Runner: registration (`glrt-…` token) plus Helm chart |
+| `services/gitlab/lib/token.sh` | `_saas_gitlab_mint_pat`, shared PAT minting used by both `runner.sh` and `saas gitlab token mint` |
 | `services/gitlab/lib/ssh.sh` | SSH exposure via `kind_cluster expose` plus `~/.ssh/config` snippet |
-| `services/gitlab/lib/credentials.sh` | URL and credentials |
+| `services/gitlab/lib/credentials.sh` | URL and credentials, with an opt-in `--verify` live check |
+| `services/gitlab/lib/doctor.sh` | `saas gitlab doctor [--fix]`: diagnoses (and, with `--fix`, repairs) pods stuck `Unknown`, PostgreSQL/MinIO credential drift, and a dead kind-expose-* SSH proxy |
 | `services/gitlab/values/dev.yaml.tpl` / `prod.yaml.tpl` | Base overlays for the `gitlab/gitlab` chart, rendered with `envsubst` |
 | `services/gitlab/values/datastore-ha.yaml.tpl` | Layered on top of `prod.yaml.tpl` unconditionally (HA is not opt-in); points `global.psql`/`global.redis` at the HA datastore |
 | `services/gitlab/values/registry.yaml.tpl` / `pages.yaml.tpl` | Layered on when `--registry`/`--pages` are enabled |
@@ -78,6 +80,10 @@ All internal paths are resolved via `BASH_SOURCE` (see `saas.sh` and `services/g
       2. Toggling `--pages-url-mode` from `subdomain` back to `path` on an already-installed release, to confirm the wildcard `Certificate`/`Secret` and the CoreDNS `template` block are actually torn down cleanly on a live cluster. The CoreDNS block-removal logic itself IS unit-tested (`test-argparse-values.sh`), just never exercised end-to-end on a real release.
       Before relying on either, verify manually first; `tests/gitlab/unit/test-argparse-values.sh`'s coverage of the underlying logic is not a substitute for a real run of these two specific paths.
 - **`--storage-mode` (kind) vs. `--storage-class` (existing) are mutually exclusive and validated as an explicit error**, never a flag silently ignored. See `install.sh`, the `--cluster-mode` validation section.
+- **`saas gitlab doctor`'s PostgreSQL password reset uses `pg_ctl reload`, never a `psql`-issued `SELECT pg_reload_conf()`.** The fix has to edit `pg_hba.conf` to temporarily add a `local all all trust` rule, then reload it so that rule takes effect, then `ALTER USER gitlab WITH PASSWORD ...`. The tempting way to trigger that reload is `psql -c 'SELECT pg_reload_conf()'`, but that call itself still has to authenticate under the OLD rules (the very ones potentially broken), a chicken-and-egg problem. `pg_ctl reload -D "$PGDATA"` is an OS-level command against the data directory, no DB connection/auth involved at all, so it works regardless of whether the current password is valid. The original `pg_hba.conf` is always restored via a `trap ... EXIT` inside the single `kubectl exec -i ... sh -c` script, so a partial failure (e.g. `ALTER USER` itself failing) never leaves `trust` auth active.
+  - Deliberately scoped to `--mode dev`'s single-instance StatefulSet only. `--mode prod`'s CloudNativePG-managed `Cluster` reconciles its own credentials/`pg_hba.conf` continuously; hand-editing it the same way would fight the operator's own reconciliation loop, so `doctor` skips PostgreSQL entirely when `SAAS_GITLAB_STATE_MODE=prod` and reports that explicitly rather than silently doing nothing.
+- **MinIO secret drift is always reconciled FROM the running pod's own env, never from the saved state.** `doctor`'s source of truth for the "real" MinIO password is `kubectl exec` + `printenv MINIO_ROOT_PASSWORD` on the actual running pod, not `SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD`: the pod is what GitLab is really authenticating against, and the whole point of this check is to catch cases where the 4 derived Secrets (or the state file itself) no longer agree with it, so treating the state file as authoritative would be circular.
+- **`saas gitlab doctor` is diagnose-only by default; `--fix` is required to change anything.** A deliberate choice (not the only reasonable one: an earlier design considered auto-repairing by default) so that force-deleting pods, temporarily enabling `trust` auth on PostgreSQL, and rewriting Secrets/restarting Deployments is always an explicit, opt-in action, matching common CLI conventions (`brew doctor`, `npm audit`) rather than something a bare `doctor` call does silently.
 - **No flag requires a value with no default unless it's genuinely impossible to guess**: `--email`/`--domain` (with `--tls letsencrypt`) and `--dns-token` (with `--challenge dns01`) are the only three. Everything else, including `StorageClass` resolution in `--cluster-mode existing` with several ambiguous options, has a reasonable automatic default even in `--non-interactive` (warning on stderr if it had to pick among several), the same principle `kind_cluster` already uses for its prompts.
 
 ## Manual testing
@@ -106,6 +112,7 @@ Note: `helm template` without a real cluster doesn't detect the real Kubernetes 
 | `kubectl`, `helm`, `jq`, `envsubst` | all of `services/gitlab/lib/*.sh` |
 | `kind_cluster` (`bash-aliases` repo) | `cluster.sh`, `ssh.sh`; `--cluster-mode kind` only |
 | `curl` (inside the cluster, `curlimages/curl` image) | `runner.sh`, to call the GitLab API from inside without exposing anything new on the host |
+| `docker` (called directly, not only via `kind_cluster`) | `doctor.sh`'s kind-expose-* check, reading the same `kind-cluster.expose.*` container labels the sibling repo's `_kind_cluster_expose_add` itself uses; `--cluster-mode kind` only |
 
 ## Pinned versions
 

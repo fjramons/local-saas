@@ -1,36 +1,15 @@
-# --- GitLab Runner (Kubernetes executor) for 'saas gitlab', integrated into 'install'. Registration no longer uses "registration tokens" (deprecated): a 'root' Personal Access Token is minted via 'gitlab-rails runner' in the toolbox pod, and it's used to request a runner authentication token (glrt-…) from the POST /user/runners API, the same flow GitLab documents for automating runner creation.
+# --- GitLab Runner (Kubernetes executor) for 'saas gitlab', integrated into 'install'. Registration no longer uses "registration tokens" (deprecated): a 'root' Personal Access Token is minted via '_saas_gitlab_mint_pat' (token.sh, shared with 'saas gitlab token mint') and used to request a runner authentication token (glrt-…) from the POST /user/runners API, the same flow GitLab documents for automating runner creation.
 #
 # The runner (and the initial registration) use the configured PUBLIC domain (global.hosts.domain), not an internal Service. Verified in practice that it has to be this way: GitLab always uses that same domain as CI_SERVER_URL/repo_url for the 'git clone' each CI job does inside its own pod, so even if the runner itself could talk to an internal Service, the jobs would still try to resolve the public domain. That's why that domain has to genuinely resolve FROM INSIDE the cluster (see '_saas_gitlab_cluster_patch_coredns' in cluster.sh, which in --cluster-mode kind points the domain at ingress-nginx's ClusterIP), and with --tls self-signed, the runner additionally needs to trust our self-signed CA (--set certsSecretName, see below). Without both at once the job fails with "Could not resolve host" or a TLS error.
 
 _SAAS_GITLAB_RUNNER_HELM_REPO_NAME="gitlab"
-
-# _saas_gitlab_runner_mint_root_pat NAMESPACE RELEASE
-# Prints a one-off root PAT to stdout (scopes api + create_runner, expires in 1 day). Never persisted anywhere.
-_saas_gitlab_runner_mint_root_pat() {
-    local ns="$1" release="$2"
-    local toolbox_pod
-    toolbox_pod="$(kubectl -n "$ns" get pods -o name 2>/dev/null | grep -m1 "${release}-toolbox" | sed 's#^pod/##')"
-    [ -n "$toolbox_pod" ] || { _saas_log_err "Could not find '$release''s toolbox pod in namespace '$ns'."; return 1; }
-
-    local script='
-u = User.find_by_username("root")
-t = u.personal_access_tokens.create(scopes: ["api", "create_runner"], name: "saas-gitlab-bootstrap", expires_at: 1.day.from_now)
-if t.persisted?
-  puts t.token
-else
-  STDERR.puts t.errors.full_messages.join(", ")
-  exit 1
-end
-'
-    kubectl -n "$ns" exec "$toolbox_pod" -- gitlab-rails runner "$script" 2>/dev/null
-}
 
 # _saas_gitlab_runner_register NAMESPACE RELEASE DOMAIN
 # Prints the runner authentication token (glrt-…) to stdout. -k: the ephemeral pod making this one call has no need to trust the self-signed CA (unlike the runner/jobs, which need to persistently, see certsSecretName in _saas_gitlab_runner_install).
 _saas_gitlab_runner_register() {
     local ns="$1" release="$2" domain="$3"
     local pat
-    pat="$(_saas_gitlab_runner_mint_root_pat "$ns" "$release")" || return 1
+    pat="$(_saas_gitlab_mint_pat "$ns" "$release" "root" "api,create_runner" "1")" || return 1
     [ -n "$pat" ] || { _saas_log_err "Could not mint a root access token."; return 1; }
 
     local response

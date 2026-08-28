@@ -106,7 +106,29 @@ Switching `--pages-url-mode` on an existing release changes the public URL shape
 saas gitlab credentials
 ```
 
-Prints the URL, the `root` user, and its initial password (generated and saved during install, no need to go dig it out by hand, though the command also prints how to do that from the Secret if you prefer).
+Prints the URL, the `root` user, and its initial password (generated and saved during install, no need to go dig it out by hand, though the command also prints how to do that from the Secret if you prefer). Add `--verify` to actually check the saved password against the live instance (execs into the toolbox pod): useful if `root` already existed from a prior install, since GitLab only applies `initialRootPassword` the very first time it boots with no admin user at all.
+
+```bash
+saas gitlab credentials --verify
+```
+
+### Personal Access Tokens
+
+```bash
+saas gitlab token mint                          # root, scope 'api', 1 day
+saas gitlab token mint demo root api,create_runner 7
+```
+
+Mints a Personal Access Token via `gitlab-rails runner` in the toolbox pod and prints it to stdout. Never persisted anywhere: run it again to mint a new one.
+
+### Diagnose / repair a broken install
+
+```bash
+saas gitlab doctor            # report only, nothing is changed
+saas gitlab doctor --fix      # apply repairs
+```
+
+Checks for problems a host reboot mid-session (or similar disruption outside this tool's control) can leave behind: pods stuck in `Unknown` phase, the PostgreSQL password no longer matching the persisted data directory (`--mode dev` only), the 4 MinIO-derived Secrets drifting from MinIO's own actual running credentials, and a dead `kind-expose-*` SSH proxy container. `--fix` is required to actually apply any repair; a bare `doctor` call never changes anything.
 
 ### CI / GitLab Runner
 
@@ -161,7 +183,7 @@ bash tests/gitlab/e2e/run-tests.sh --keep                 # don't tear down at t
 bash tests/gitlab/e2e/run-tests.sh --only prod-ha          # opt-in, heavy (HA datastore), not part of the default run
 ```
 
-The default E2E run covers, in order: `dev-install` (a real install, checks the ingress actually serves traffic and the runner registers), `registry`/`pages` (their endpoints are genuinely reachable, not just that the chart install succeeded), `duckdns` (the cert-manager webhook installs and comes up healthy; no real ACME issuance, since that needs a real DuckDNS account), `up-down` (destroy/recreate preserves the same credentials against the same data), and `ssh-config`. `prod-ha` is opt-in only (see above) and covers the HA PostgreSQL/Redis/MinIO path.
+The default E2E run covers, in order: `dev-install` (a real install, checks the ingress actually serves traffic, `credentials --verify` and `token mint` both work against the live instance, and the runner registers), `registry-push-pull`/`reinstall` (a real image push/pull, then a second `install` against the already-provisioned release), `doctor` (deliberately corrupts a MinIO Secret and checks `doctor`/`doctor --fix` detect and repair it), `registry`/`pages` (their endpoints are genuinely reachable, not just that the chart install succeeded), `duckdns` (the cert-manager webhook installs and comes up healthy; no real ACME issuance, since that needs a real DuckDNS account), `up-down` (destroy/recreate preserves the same credentials against the same data), and `ssh-config`. `prod-ha` is opt-in only (see above) and covers the HA PostgreSQL/Redis/MinIO path.
 
 ## Repository layout
 
@@ -170,7 +192,7 @@ saas.sh              # public dispatcher `saas SERVICE SUBCOMMAND ...`
 lib/common.sh         # shared helpers (logging, prompts, getopt)
 services/gitlab/       # everything GitLab-specific
   gitlab.sh             # `_saas_gitlab` dispatcher (subcommands)
-  lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install, runner, ssh, state, credentials
+  lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install, runner, token, ssh, state, credentials, doctor
   values/               # dev/prod/datastore-ha/registry/pages .yaml.tpl overlays for the gitlab/gitlab chart
 tests/gitlab/
   unit/                  # fast, no real cluster (mock kubectl/helm/kind_cluster)

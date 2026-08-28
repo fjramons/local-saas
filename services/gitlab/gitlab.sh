@@ -18,12 +18,16 @@ source "$_SAAS_GITLAB_DIR/lib/datastore-ha.sh"
 source "$_SAAS_GITLAB_DIR/lib/tls.sh"
 # shellcheck source=lib/install.sh
 source "$_SAAS_GITLAB_DIR/lib/install.sh"
+# shellcheck source=lib/token.sh
+source "$_SAAS_GITLAB_DIR/lib/token.sh"
 # shellcheck source=lib/runner.sh
 source "$_SAAS_GITLAB_DIR/lib/runner.sh"
 # shellcheck source=lib/ssh.sh
 source "$_SAAS_GITLAB_DIR/lib/ssh.sh"
 # shellcheck source=lib/credentials.sh
 source "$_SAAS_GITLAB_DIR/lib/credentials.sh"
+# shellcheck source=lib/doctor.sh
+source "$_SAAS_GITLAB_DIR/lib/doctor.sh"
 
 _saas_gitlab_help() {
     cat <<'EOF'
@@ -43,6 +47,8 @@ Subcommands:
   delete        Full uninstall
   ssh-config    ~/.ssh/config block to clone without touching port 22
   runner        GitLab Runner management (status, reregister)
+  token         Mint a Personal Access Token (see 'saas gitlab token --help')
+  doctor        Diagnose (and, with --fix, repair) a broken install
 
 Examples:
   saas gitlab install
@@ -51,6 +57,7 @@ Examples:
   saas gitlab credentials
   saas gitlab down
   saas gitlab up
+  saas gitlab doctor
 EOF
 }
 
@@ -68,6 +75,8 @@ _saas_gitlab() {
         delete)       _saas_gitlab_delete "$@" ;;
         ssh-config)   _saas_gitlab_ssh_config "$@" ;;
         runner)       _saas_gitlab_runner "$@" ;;
+        token)        _saas_gitlab_token "$@" ;;
+        doctor)       _saas_gitlab_doctor "$@" ;;
         ""|-h|--help|help)
             _saas_gitlab_help
             ;;

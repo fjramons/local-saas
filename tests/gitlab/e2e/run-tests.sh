@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
         --keep) KEEP=true; shift ;;
         --only) ONLY="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--keep] [--only dev-install|registry-push-pull|reinstall|registry|pages|duckdns|up-down|ssh-config|prod-ha|pages-subdomain]"
+            echo "Usage: $0 [--keep] [--only dev-install|registry-push-pull|reinstall|doctor|registry|pages|duckdns|up-down|ssh-config|prod-ha|pages-subdomain]"
             exit 0
             ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -167,6 +167,21 @@ if run_phase dev-install; then
     password="$(saas gitlab credentials "$RELEASE" 2>/dev/null | awk '/^Password:/{print $2}')"
     [ -n "$password" ] && [ "$password" != "" ] && pass "credentials prints a root password" || fail "credentials prints a root password"
 
+    if saas gitlab credentials "$RELEASE" --verify 2>&1 | grep -qi "verified"; then
+        pass "credentials --verify confirms the saved root password against the live instance"
+    else
+        fail "credentials --verify confirms the saved root password against the live instance"
+    fi
+
+    token="$(saas gitlab token mint "$RELEASE" root api 1 2>/dev/null)"
+    if [ -n "$token" ]; then
+        pass "token mint prints a token"
+        api_user="$(curl -sk -H "PRIVATE-TOKEN: $token" "https://localhost/api/v4/user" -H "Host: ${SAAS_GITLAB_STATE_DOMAIN:-$RELEASE.gitlab.local}" | jq -r '.username // empty')"
+        [ "$api_user" = "root" ] && pass "the minted token authenticates as root against the API" || fail "the minted token authenticates as root against the API (got user '$api_user')"
+    else
+        fail "token mint prints a token"
+    fi
+
     if kubectl -n "$RELEASE" get deployment "${RELEASE}-runner-gitlab-runner" >/dev/null 2>&1; then
         ready="$(kubectl -n "$RELEASE" get deployment "${RELEASE}-runner-gitlab-runner" -o jsonpath='{.status.readyReplicas}')"
         [ "${ready:-0}" -ge 1 ] 2>/dev/null && pass "GitLab Runner deployed with ready replicas" || fail "GitLab Runner deployed but no ready replicas"
@@ -264,6 +279,65 @@ if run_phase reinstall; then
         fail "the image pushed earlier is still pullable after reinstall (MinIO auth intact, see $work_dir/crane.log)"
     fi
     rm -rf "$work_dir"
+fi
+
+# ------------------------------------------------------------------
+# Phase: doctor (depends on 'dev-install' and 'registry-push-pull': deliberately corrupts the
+# registry-storage Secret's MinIO password, the same kind of drift a host reboot can leave behind
+# (see doctor.sh), then checks 'saas gitlab doctor' both detects it (no --fix) and repairs it
+# (--fix), confirmed by a real registry pull afterward of the image pushed in 'registry-push-pull'.
+# A genuine host-reboot-induced PostgreSQL/Unknown-pod scenario isn't practically reproducible in
+# CI, so this phase scopes e2e coverage to the MinIO secret-drift path; the pure detection logic for
+# every check (including PostgreSQL/pods/kind-expose) is covered by the unit tests instead.
+# ------------------------------------------------------------------
+if run_phase doctor; then
+    echo "=== Phase: doctor ==="
+    _saas_gitlab_state_load "$RELEASE" 2>/dev/null || { fail "doctor: no saved state (did you run 'dev-install' first?)"; }
+
+    ns="${SAAS_GITLAB_STATE_NAMESPACE:-$RELEASE}"
+    registry_host="registry.${SAAS_GITLAB_STATE_DOMAIN}"
+    image_ref="${registry_host}/root/e2e-smoke:latest"
+
+    original_config="$(kubectl -n "$ns" get secret "${RELEASE}-datastore-registry-storage" -o jsonpath='{.data.config}' | base64 -d)"
+    corrupted_config="$(echo "$original_config" | sed 's/secretkey: .*/secretkey: totally-wrong-password/')"
+    kubectl -n "$ns" create secret generic "${RELEASE}-datastore-registry-storage" \
+        --from-literal=config="$corrupted_config" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+    registry_deploy="$(kubectl -n "$ns" get deployment -o name 2>/dev/null | grep -m1 "${RELEASE}-registry" | sed 's#^deployment.apps/##')"
+    if [ -n "$registry_deploy" ]; then
+        kubectl -n "$ns" rollout restart deployment "$registry_deploy" >/dev/null 2>&1
+        kubectl -n "$ns" rollout status deployment "$registry_deploy" --timeout=120s >/dev/null 2>&1
+    else
+        fail "doctor: could not find the registry Deployment to restart after corrupting its Secret"
+    fi
+
+    doctor_report="$(saas gitlab doctor "$RELEASE" 2>&1)"
+    echo "$doctor_report" | grep -qi "MinIO" && echo "$doctor_report" | grep -qi "out of sync" \
+        && pass "doctor (no --fix) detects the corrupted MinIO Secret" \
+        || fail "doctor (no --fix) detects the corrupted MinIO Secret (output: $doctor_report)"
+    echo "$doctor_report" | grep -q "${RELEASE}-datastore-registry-storage" \
+        && pass "doctor names the specific stale Secret" \
+        || fail "doctor names the specific stale Secret (output: $doctor_report)"
+
+    fix_report="$(saas gitlab doctor "$RELEASE" --fix 2>&1)"
+    echo "$fix_report" | grep -qi "Reconciled" \
+        && pass "doctor --fix reports the MinIO Secrets as reconciled" \
+        || fail "doctor --fix reports the MinIO Secrets as reconciled (output: $fix_report)"
+
+    work_dir="$(mktemp -d "${TMPDIR:-/tmp}/saas-e2e-doctor-XXXXXX")"
+    if _e2e_registry_ca "$ns" "$RELEASE" "$work_dir/ca.crt" \
+        && _e2e_crane "$work_dir" "$registry_host" "$SAAS_GITLAB_STATE_DOMAIN" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" "crane pull '$image_ref' /work/pulled.tar" \
+        && [ -s "$work_dir/pulled.tar" ]; then
+        pass "the registry is pullable again after 'doctor --fix' (real functional proof, not just the state file)"
+    else
+        fail "the registry is pullable again after 'doctor --fix' (see $work_dir/crane.log)"
+    fi
+    rm -rf "$work_dir"
+
+    followup_report="$(saas gitlab doctor "$RELEASE" 2>&1)"
+    echo "$followup_report" | grep -qi "Nothing to report" \
+        && pass "a follow-up doctor run reports nothing left to fix" \
+        || fail "a follow-up doctor run reports nothing left to fix (output: $followup_report)"
 fi
 
 # ------------------------------------------------------------------
