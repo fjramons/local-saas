@@ -11,11 +11,12 @@ _SAAS_GITLAB_MINIO_BUCKETS=(
     gitlab-dependency-proxy gitlab-backups gitlab-pages
 )
 
-# _saas_gitlab_datastore_secrets_apply NAMESPACE RELEASE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
-# Secrets shared by both --mode dev (this file) and --mode prod (datastore-ha.sh), same names/keys
-# in both modes, so the values templates never need to know which datastore backs them.
-_saas_gitlab_datastore_secrets_apply() {
-    local ns="$1" release="$2" psql_password="$3" minio_user="$4" minio_password="$5"
+# _saas_gitlab_datastore_psql_secret_apply NAMESPACE RELEASE PSQL_PASSWORD
+# Shared by both --mode dev (this file) and --mode prod (datastore-ha.sh), same name/keys in both
+# modes. Always called regardless of --object-storage: PostgreSQL/Redis stay internal to 'saas
+# gitlab' either way, only object storage is ever externalized (see install.sh).
+_saas_gitlab_datastore_psql_secret_apply() {
+    local ns="$1" release="$2" psql_password="$3"
 
     kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
@@ -25,6 +26,17 @@ _saas_gitlab_datastore_secrets_apply() {
         --type=kubernetes.io/basic-auth \
         --from-literal=username=gitlab --from-literal=password="$psql_password" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
+}
+
+# _saas_gitlab_datastore_minio_secrets_apply NAMESPACE RELEASE MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# The 4 MinIO-derived Secrets, shared by both --mode dev (this file) and --mode prod
+# (datastore-ha.sh), same names/keys in both modes, so the values templates never need to know
+# which datastore backs them. Only called with --object-storage internal (default): with
+# 'external', these same 4 Secret names are instead applied by 'saas gitlab integrate minio' (see
+# services/gitlab/lib/minio_integration.sh and services/minio/values/gitlab-datastore-secrets.yaml.tpl),
+# pointing at a shared MinIO instance instead of this release's own private one.
+_saas_gitlab_datastore_minio_secrets_apply() {
+    local ns="$1" release="$2" minio_user="$3" minio_password="$4"
 
     kubectl -n "$ns" create secret generic "${release}-datastore-minio" \
         --from-literal=rootUser="$minio_user" --from-literal=rootPassword="$minio_password" \
@@ -105,27 +117,32 @@ EOF
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 }
 
-# _saas_gitlab_datastore_apply NAMESPACE RELEASE STORAGE_CLASS PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
-# --mode dev only (see datastore-ha.sh for --mode prod).
+# _saas_gitlab_datastore_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# --mode dev only (see datastore-ha.sh for --mode prod). OBJECT_STORAGE_MODE: 'internal' (default,
+# unchanged behavior) deploys this release's own private MinIO, same as before this parameter
+# existed; 'external' skips it entirely, relying on Secrets 'saas gitlab integrate minio' already
+# applied (see install.sh, which refuses to proceed with 'external' if they're missing).
 _saas_gitlab_datastore_apply() {
-    local ns="$1" release="$2" storage_class="$3"
-    local psql_password="$4" minio_user="$5" minio_password="$6"
+    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4"
+    local psql_password="$5" minio_user="$6" minio_password="$7"
 
-    local psql_storage="2Gi" minio_storage="5Gi"
-    local psql_cpu="200m" psql_mem="512Mi" minio_cpu="100m" minio_mem="256Mi" redis_cpu="50m" redis_mem="128Mi"
+    local psql_storage="2Gi"
+    local psql_cpu="200m" psql_mem="512Mi" redis_cpu="50m" redis_mem="128Mi"
 
-    # Two separate variables, not one reused at both indentation depths: this function emits
-    # storageClassName at two structurally different nesting levels (a StatefulSet's
-    # volumeClaimTemplates[].spec vs. a standalone PersistentVolumeClaim's spec), and YAML's
-    # indentation is meaningful. A single shared variable here was a real, live bug (see
-    # CLAUDE.md): correct at the standalone-PVC site, but wrong at the StatefulSet site, silently
-    # never caught because --cluster-mode kind always leaves storage_class empty (only
-    # --cluster-mode existing ever renders a non-empty value here).
-    local sc_field_pvc="" sc_field_sts=""
-    [ -n "$storage_class" ] && sc_field_pvc="  storageClassName: ${storage_class}"
+    # Two separate variables, not one reused at both indentation depths: this function (and
+    # _saas_gitlab_datastore_minio_internal_apply below) emit storageClassName at two structurally
+    # different nesting levels (a StatefulSet's volumeClaimTemplates[].spec vs. a standalone
+    # PersistentVolumeClaim's spec), and YAML's indentation is meaningful. A single shared variable
+    # here was a real, live bug (see CLAUDE.md): correct at the standalone-PVC site, but wrong at
+    # the StatefulSet site, silently never caught because --cluster-mode kind always leaves
+    # storage_class empty (only --cluster-mode existing ever renders a non-empty value here).
+    local sc_field_sts=""
     [ -n "$storage_class" ] && sc_field_sts="        storageClassName: ${storage_class}"
 
-    _saas_gitlab_datastore_secrets_apply "$ns" "$release" "$psql_password" "$minio_user" "$minio_password" || return 1
+    _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
+    if [ "$object_storage_mode" = "internal" ]; then
+        _saas_gitlab_datastore_minio_secrets_apply "$ns" "$release" "$minio_user" "$minio_password" || return 1
+    fi
 
     kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: v1
@@ -223,7 +240,33 @@ metadata:
 spec:
   selector: {app: ${release}-redis}
   ports: [{port: 6379, targetPort: 6379}]
----
+EOF
+
+    _saas_log_wait "Waiting for PostgreSQL/Redis to be ready…"
+    kubectl -n "$ns" rollout status statefulset "${release}-postgresql" --timeout=180s || return 1
+    kubectl -n "$ns" rollout status deployment "${release}-redis" --timeout=120s || return 1
+
+    if [ "$object_storage_mode" = "internal" ]; then
+        _saas_gitlab_datastore_minio_internal_apply "$ns" "$release" "$storage_class" || return 1
+    else
+        _saas_log_info "Object storage: external (managed by 'saas minio'), no private MinIO deployed here."
+    fi
+
+    _saas_log_ok "PostgreSQL/Redis ready."
+}
+
+# _saas_gitlab_datastore_minio_internal_apply NAMESPACE RELEASE STORAGE_CLASS
+# This release's own single-instance MinIO Deployment/PVC/Service, extracted out of
+# _saas_gitlab_datastore_apply so it can be skipped entirely with --object-storage external. Only
+# called with 'internal' (the default); the 4 MinIO-derived Secrets it depends on
+# (_saas_gitlab_datastore_minio_secrets_apply) must already have been applied by the caller.
+_saas_gitlab_datastore_minio_internal_apply() {
+    local ns="$1" release="$2" storage_class="$3"
+    local minio_storage="5Gi" minio_cpu="100m" minio_mem="256Mi"
+    local sc_field_pvc=""
+    [ -n "$storage_class" ] && sc_field_pvc="  storageClassName: ${storage_class}"
+
+    kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -239,7 +282,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          image: ${_SAAS_MINIO_IMAGE}
           args: ["server", "/data", "--console-address", ":9001"]
           ports: [{containerPort: 9000}, {containerPort: 9001}]
           env:
@@ -277,13 +320,11 @@ spec:
   ports: [{name: api, port: 9000, targetPort: 9000}, {name: console, port: 9001, targetPort: 9001}]
 EOF
 
-    _saas_log_wait "Waiting for PostgreSQL/Redis/MinIO to be ready…"
-    kubectl -n "$ns" rollout status statefulset "${release}-postgresql" --timeout=180s || return 1
-    kubectl -n "$ns" rollout status deployment "${release}-redis" --timeout=120s || return 1
+    _saas_log_wait "Waiting for MinIO to be ready…"
     kubectl -n "$ns" rollout status deployment "${release}-minio" --timeout=120s || return 1
 
     _saas_gitlab_datastore_init_buckets "$ns" "$release" || return 1
-    _saas_log_ok "PostgreSQL/Redis/MinIO ready."
+    _saas_log_ok "MinIO ready."
 }
 
 # _saas_gitlab_datastore_minio_ha_apply NAMESPACE RELEASE STORAGE_CLASS MINIO_ROOT_USER MINIO_ROOT_PASSWORD
@@ -339,7 +380,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          image: ${_SAAS_MINIO_IMAGE}
           args: ["server", "${minio_endpoint}", "--console-address", ":9001"]
           ports: [{containerPort: 9000}, {containerPort: 9001}]
           env:
@@ -394,7 +435,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: mc
-          image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+          image: ${_SAAS_MC_IMAGE}
           env:
             - name: MINIO_USER
               valueFrom: {secretKeyRef: {name: ${release}-datastore-minio, key: rootUser}}

@@ -31,6 +31,8 @@ source "$_SAAS_VAULT_DIR/lib/integration_common.sh"
 source "$_SAAS_VAULT_DIR/lib/gitlab_integration.sh"
 # shellcheck source=lib/eso_integration.sh
 source "$_SAAS_VAULT_DIR/lib/eso_integration.sh"
+# shellcheck source=lib/minio_integration.sh
+source "$_SAAS_VAULT_DIR/lib/minio_integration.sh"
 
 _saas_vault_integrate_help() {
     cat <<'EOF'
@@ -39,6 +41,8 @@ Usage: saas vault integrate TARGET [OPTIONS]
 Targets:
   gitlab   Wire this Vault release up for a GitLab instance, see
            'saas vault integrate gitlab --help'
+  minio    Wire this Vault release up for a MinIO instance, see
+           'saas vault integrate minio --help'
   eso      Wire this Vault release up for an arbitrary External
            Secrets Operator installation, see 'saas vault integrate
            eso --help'
@@ -50,6 +54,7 @@ _saas_vault_integrate() {
     [ $# -gt 0 ] && shift
     case "$target" in
         gitlab) _saas_vault_integrate_gitlab "$@" ;;
+        minio)  _saas_vault_integrate_minio "$@" ;;
         eso)    _saas_vault_integrate_eso "$@" ;;
         ""|-h|--help|help)
             _saas_vault_integrate_help
@@ -83,7 +88,7 @@ Subcommands:
   down          Destroy the kind cluster, preserving the data (suspend)
   delete        Full uninstall
   doctor        Diagnose (and, with --fix, repair) a broken install
-  integrate     Wire this Vault up for GitLab or ESO, see
+  integrate     Wire this Vault up for GitLab, MinIO, or ESO, see
                 'saas vault integrate --help'
 
 Examples:
@@ -91,6 +96,7 @@ Examples:
   saas vault status
   saas vault credentials
   saas vault integrate gitlab --gitlab-release gitlab
+  saas vault integrate minio --minio-release minio
   saas vault down
   saas vault up
   saas vault doctor

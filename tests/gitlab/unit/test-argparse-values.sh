@@ -24,6 +24,7 @@ source "$REPO_ROOT/services/gitlab/lib/install.sh"
 source "$REPO_ROOT/services/gitlab/lib/token.sh"
 source "$REPO_ROOT/services/gitlab/lib/runner.sh"
 source "$REPO_ROOT/services/gitlab/lib/doctor.sh"
+source "$REPO_ROOT/services/gitlab/lib/minio_integration.sh"
 
 export SAAS_GITLAB_STATE_DIR
 SAAS_GITLAB_STATE_DIR="$(mktemp -d)"
@@ -479,6 +480,69 @@ docker() {
 _saas_gitlab_doctor_check_expose "mycluster" "2222" && pass "doctor check_expose: detects a running proxy" || fail "doctor check_expose: detects a running proxy"
 _saas_gitlab_doctor_check_expose "mycluster" "9999" && fail "doctor check_expose: doesn't detect a proxy on a different port" || pass "doctor check_expose: doesn't detect a proxy on a different port"
 unset -f docker
+
+# ------------------------------------------------------------------
+# --object-storage validator, and the datastore.sh split (psql secret always applied, MinIO
+# secrets/Deployment only with 'internal')
+# ------------------------------------------------------------------
+_saas_gitlab_valid_object_storage_mode "internal" && pass "valid_object_storage_mode accepts 'internal'" || fail "valid_object_storage_mode accepts 'internal'"
+_saas_gitlab_valid_object_storage_mode "external" && pass "valid_object_storage_mode accepts 'external'" || fail "valid_object_storage_mode accepts 'external'"
+_saas_gitlab_valid_object_storage_mode "s3" && fail "valid_object_storage_mode rejects 's3'" || pass "valid_object_storage_mode rejects 's3'"
+
+# 'create secret ... | kubectl apply -f -' runs its LEFT side in a subshell (the documented pipe
+# gotcha, see e.g. the vault unit test's unseal_secret_apply case): a plain variable set from
+# inside the mocked kubectl there would be lost the instant that subshell exits, so capture to a
+# FILE instead, which survives.
+_TEST_MINIO_SECRET_FILE="$(mktemp)"
+kubectl() {
+    case "$*" in
+        "create namespace splitns --dry-run=client -o yaml") echo "kind: Namespace" ;;
+        "apply -f -") cat >/dev/null ;;
+        "-n splitns create secret generic split-datastore-psql --type=kubernetes.io/basic-auth --from-literal=username=gitlab --from-literal=password=pw --dry-run=client -o yaml") echo "kind: Secret" ;;
+        "-n splitns create secret generic split-datastore-minio --from-literal=rootUser=u --from-literal=rootPassword=p --dry-run=client -o yaml") echo "created" > "$_TEST_MINIO_SECRET_FILE"; echo "kind: Secret" ;;
+        *) return 1 ;;
+    esac
+}
+_saas_gitlab_datastore_psql_secret_apply "splitns" "split" "pw" >/dev/null 2>&1
+[ -s "$_TEST_MINIO_SECRET_FILE" ] && fail "datastore_psql_secret_apply: must not create the MinIO secret" || pass "datastore_psql_secret_apply: creates only the psql secret"
+_saas_gitlab_datastore_minio_secrets_apply "splitns" "split" "u" "p" >/dev/null 2>&1
+[ -s "$_TEST_MINIO_SECRET_FILE" ] && pass "datastore_minio_secrets_apply: creates the MinIO secret" || fail "datastore_minio_secrets_apply: creates the MinIO secret"
+unset -f kubectl
+rm -f "$_TEST_MINIO_SECRET_FILE"
+
+# ------------------------------------------------------------------
+# 'saas gitlab integrate minio': single round trip (no reviewer-SA handshake, unlike vault's).
+# Missing manifest -> clear error, no apply attempted; present -> namespace ensured + applied.
+# ------------------------------------------------------------------
+_saas_gitlab_state_save "minoitest" "RELEASE=minoitest" "NAMESPACE=minoins"
+_TEST_APPLY_CALLED=false
+kubectl() {
+    case "$*" in
+        apply*) _TEST_APPLY_CALLED=true ;;
+        *) return 1 ;;
+    esac
+}
+_saas_gitlab_integrate_minio --release minoitest --from-dir "/nonexistent/$$" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && ! $_TEST_APPLY_CALLED && pass "gitlab integrate minio: missing manifest -> clear error, no apply attempted" || fail "gitlab integrate minio: missing manifest -> clear error, no apply attempted"
+
+_TEST_DIR2="$(mktemp -d)"
+echo "apiVersion: v1" > "$_TEST_DIR2/gitlab-datastore-secrets.yaml"
+_TEST_NS_CREATED_FILE="$(mktemp)"
+_TEST_APPLY_CALLED=false
+kubectl() {
+    case "$*" in
+        "create namespace minoins --dry-run=client -o yaml") echo "created" > "$_TEST_NS_CREATED_FILE"; echo "kind: Namespace" ;;
+        "apply -f -") cat >/dev/null ;;
+        "-n minoins apply -f $_TEST_DIR2/gitlab-datastore-secrets.yaml") _TEST_APPLY_CALLED=true ;;
+        *) return 1 ;;
+    esac
+}
+_saas_gitlab_integrate_minio --release minoitest --from-dir "$_TEST_DIR2" >/dev/null 2>&1
+[ -s "$_TEST_NS_CREATED_FILE" ] && $_TEST_APPLY_CALLED && pass "gitlab integrate minio: ensures namespace and applies the rendered secrets" || fail "gitlab integrate minio: ensures namespace and applies the rendered secrets"
+unset -f kubectl
+_saas_gitlab_state_delete "minoitest"
+rm -rf "$_TEST_DIR2" "$_TEST_NS_CREATED_FILE"
 
 # ------------------------------------------------------------------
 # Summary

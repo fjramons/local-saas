@@ -142,7 +142,7 @@ _saas_gitlab_doctor_fix_minio() {
     [ -n "$minio_user" ] || minio_user="${SAAS_GITLAB_STATE_MINIO_ROOT_USER:-}"
     [ -n "$minio_user" ] || { _saas_log_err "Could not determine the MinIO root user."; return 1; }
 
-    _saas_gitlab_datastore_secrets_apply "$ns" "$release" "${SAAS_GITLAB_STATE_PSQL_PASSWORD:-}" "$minio_user" "$real_password" || return 1
+    _saas_gitlab_datastore_minio_secrets_apply "$ns" "$release" "$minio_user" "$real_password" || return 1
 
     local deploy
     deploy="$(kubectl -n "$ns" get deployment -o name 2>/dev/null | grep -m1 "${release}-registry" | sed 's#^deployment.apps/##')"
@@ -244,6 +244,9 @@ _saas_gitlab_doctor() {
     fi
 
     # C. MinIO secrets
+    if [ "${SAAS_GITLAB_STATE_OBJECT_STORAGE_MODE:-internal}" = "external" ]; then
+        echo "ℹ️  MinIO: --object-storage external (managed by 'saas minio'), not covered by this check."
+    else
     local -a minio_out=()
     while IFS= read -r line; do [ -n "$line" ] && minio_out+=("$line"); done < <(_saas_gitlab_doctor_check_minio "$ns" "$release")
     if [ "${#minio_out[@]}" -eq 0 ]; then
@@ -264,6 +267,7 @@ _saas_gitlab_doctor() {
                 fi
             fi
         fi
+    fi
     fi
 
     # D. kind-expose SSH proxy

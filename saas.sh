@@ -17,6 +17,8 @@ source "$_SAAS_ROOT_DIR/lib/common.sh"
 source "$_SAAS_ROOT_DIR/services/gitlab/gitlab.sh"
 # shellcheck source=services/vault/vault.sh
 source "$_SAAS_ROOT_DIR/services/vault/vault.sh"
+# shellcheck source=services/minio/minio.sh
+source "$_SAAS_ROOT_DIR/services/minio/minio.sh"
 
 _saas_help() {
     cat <<'EOF'
@@ -28,6 +30,8 @@ Kubernetes.
 Available services:
   gitlab    Self-hosted GitLab (official Helm chart), see 'saas gitlab --help'
   vault     Self-hosted OpenBao (alias: openbao), see 'saas vault --help'
+  minio     Standalone S3-compatible object storage (alias: object-storage),
+            see 'saas minio --help'
 
 Examples:
   saas gitlab install
@@ -35,6 +39,8 @@ Examples:
   saas gitlab install --help
   saas vault install
   saas openbao install --help
+  saas minio install
+  saas object-storage install --help
 EOF
 }
 
@@ -48,6 +54,9 @@ saas() {
             ;;
         vault|openbao)
             _saas_vault "$@"
+            ;;
+        minio|object-storage)
+            _saas_minio "$@"
             ;;
         ""|-h|--help|help)
             _saas_help

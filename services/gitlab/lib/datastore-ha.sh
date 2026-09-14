@@ -34,15 +34,21 @@ _saas_gitlab_wait_for_resource() {
     done
 }
 
-# _saas_gitlab_datastore_ha_apply NAMESPACE RELEASE STORAGE_CLASS PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD REDIS_PASSWORD
+# _saas_gitlab_datastore_ha_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD REDIS_PASSWORD
+# OBJECT_STORAGE_MODE: see datastore.sh's _saas_gitlab_datastore_apply for the 'internal'/'external'
+# split; here it gates the 4-node distributed MinIO at the bottom of this function instead of the
+# single-instance one.
 _saas_gitlab_datastore_ha_apply() {
-    local ns="$1" release="$2" storage_class="$3"
-    local psql_password="$4" minio_user="$5" minio_password="$6" redis_password="$7"
+    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4"
+    local psql_password="$5" minio_user="$6" minio_password="$7" redis_password="$8"
 
     _saas_gitlab_operator_cnpg_ensure || return 1
     _saas_gitlab_operator_redis_ensure || return 1
 
-    _saas_gitlab_datastore_secrets_apply "$ns" "$release" "$psql_password" "$minio_user" "$minio_password" || return 1
+    _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
+    if [ "$object_storage_mode" = "internal" ]; then
+        _saas_gitlab_datastore_minio_secrets_apply "$ns" "$release" "$minio_user" "$minio_password" || return 1
+    fi
 
     kubectl -n "$ns" create secret generic "${release}-datastore-redis" \
         --type=kubernetes.io/basic-auth \
@@ -146,9 +152,13 @@ EOF
     }
     kubectl -n "$ns" rollout status statefulset "${release}-redis-sentinel" --timeout=300s || return 1
 
-    _saas_gitlab_datastore_minio_ha_apply "$ns" "$release" "$storage_class" "$minio_user" "$minio_password" || return 1
-
-    _saas_log_ok "HA PostgreSQL/Redis/MinIO ready."
+    if [ "$object_storage_mode" = "internal" ]; then
+        _saas_gitlab_datastore_minio_ha_apply "$ns" "$release" "$storage_class" "$minio_user" "$minio_password" || return 1
+        _saas_log_ok "HA PostgreSQL/Redis/MinIO ready."
+    else
+        _saas_log_info "Object storage: external (managed by 'saas minio'), no private MinIO deployed here."
+        _saas_log_ok "HA PostgreSQL/Redis ready."
+    fi
 }
 
 # _saas_gitlab_datastore_ha_delete NAMESPACE RELEASE

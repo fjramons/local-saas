@@ -1,6 +1,16 @@
 # --- Helpers shared by every service in saas.sh
 # Same idiom as kind_cluster (bash-aliases/.bash_aliases.d/local-cluster-functions.sh): getopt for flags, prompts with a bracketed default / numbered menu for enums, explicit confirmation for destructive actions, logging with semantic emoji, no 'set -e'.
 
+# MinIO/mc image pins, shared by services/gitlab/lib/datastore.sh (GitLab's own private MinIO) and
+# services/minio/lib/*.sh (the standalone service): promoted here the moment a second consumer
+# needed the exact same tags with zero variation, same threshold already used below for
+# _saas_require_kind_cluster_fn/_saas_ensure_certmanager/_saas_resolve_storage_class. Originally
+# pulled from Docker Hub's minio/minio, moved to quay.io/minio/minio (same tags) after MinIO removed
+# that entire Docker Hub repository (community edition is now source-only); re-verify quay.io
+# directly ('docker pull quay.io/minio/IMAGE:TAG') before bumping, not Docker Hub/helm search.
+_SAAS_MINIO_IMAGE="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+_SAAS_MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+
 _saas_log_info() { echo "ℹ️  $*" >&2; }
 _saas_log_ok()   { echo "✅ $*" >&2; }
 _saas_log_warn() { echo "⚠️  $*" >&2; }

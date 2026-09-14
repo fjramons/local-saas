@@ -34,14 +34,18 @@ source "$REPO_ROOT/services/vault/lib/doctor.sh"
 source "$REPO_ROOT/services/vault/lib/integration_common.sh"
 source "$REPO_ROOT/services/vault/lib/gitlab_integration.sh"
 source "$REPO_ROOT/services/vault/lib/eso_integration.sh"
+source "$REPO_ROOT/services/vault/lib/minio_integration.sh"
 source "$REPO_ROOT/services/gitlab/lib/state.sh"
 source "$REPO_ROOT/services/gitlab/lib/vault_integration.sh"
+source "$REPO_ROOT/services/minio/lib/state.sh"
 
 export SAAS_VAULT_STATE_DIR
 SAAS_VAULT_STATE_DIR="$(mktemp -d)"
 export SAAS_GITLAB_STATE_DIR
 SAAS_GITLAB_STATE_DIR="$(mktemp -d)"
-trap 'rm -rf "$SAAS_VAULT_STATE_DIR" "$SAAS_GITLAB_STATE_DIR"' EXIT
+export SAAS_MINIO_STATE_DIR
+SAAS_MINIO_STATE_DIR="$(mktemp -d)"
+trap 'rm -rf "$SAAS_VAULT_STATE_DIR" "$SAAS_GITLAB_STATE_DIR" "$SAAS_MINIO_STATE_DIR"' EXIT
 
 # ------------------------------------------------------------------
 # Pure validators
@@ -282,6 +286,78 @@ $_TEST_APPLY_CALLED && pass "gitlab integrate vault: fully ready -> applies Secr
 unset -f kubectl
 _saas_gitlab_state_delete "glbtest"
 rm -rf "$_TEST_DIR" "$_TEST_OUT_DIR" "$_TEST_OUT_DIR2"
+
+# ------------------------------------------------------------------
+# 'saas vault integrate minio': same order-independence proof as 'integrate gitlab' above, direct
+# structural copy reusing every generic helper in integration_common.sh unchanged.
+# ------------------------------------------------------------------
+_saas_vault_state_save "obtest" "RELEASE=obtest" "NAMESPACE=obns" "MODE=dev" "DOMAIN=obtest.vault.local" "KEY_SHARES=5" "KEY_THRESHOLD=3"
+_saas_vault_secrets_save "obtest" "s.roottoken" "k1,k2,k3,k4,k5"
+
+_saas_vault_bao_exec() { _TEST_MUTATION_CALLS=$((_TEST_MUTATION_CALLS + 1)); echo '{}'; }
+_saas_vault_bao_exec_stdin() { _TEST_MUTATION_CALLS=$((_TEST_MUTATION_CALLS + 1)); cat >/dev/null; }
+
+# Case 1: target MinIO cluster is NOT reachable.
+kubectl() {
+    case "$*" in
+        "-n obns exec obtest-openbao-0 -c openbao -- env BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/openbao/tls/ca.crt bao status -format=json") echo '{"sealed":false,"initialized":true}' ;;
+        "--context unreachable-ctx --request-timeout=10s get --raw /healthz") return 1 ;;
+        *) return 1 ;;
+    esac
+}
+_TEST_MUTATION_CALLS=0
+_saas_vault_integrate_minio --vault-release obtest --minio-context unreachable-ctx >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ "$_TEST_MUTATION_CALLS" -eq 0 ] \
+    && pass "integrate minio: target unreachable -> fails, zero Vault mutation (order-independence)" \
+    || fail "integrate minio: target unreachable -> fails, zero Vault mutation (rc=$rc calls=$_TEST_MUTATION_CALLS)"
+unset -f kubectl
+
+# Case 2: target reachable, reviewer ServiceAccount/token missing -> renders manifest, fails, zero mutation.
+kubectl() {
+    case "$*" in
+        "-n obns exec obtest-openbao-0 -c openbao -- env BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/openbao/tls/ca.crt bao status -format=json") echo '{"sealed":false,"initialized":true}' ;;
+        "--context reachable-ctx --request-timeout=10s get --raw /healthz") return 0 ;;
+        "--context reachable-ctx -n vault-integration get secret obtest-vault-reviewer-token") return 1 ;;
+        *) return 1 ;;
+    esac
+}
+_TEST_MUTATION_CALLS=0
+_TEST_MINIO_OUT_DIR="$(mktemp -d)"
+_saas_vault_integrate_minio --vault-release obtest --minio-context reachable-ctx --output-dir "$_TEST_MINIO_OUT_DIR" >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && [ "$_TEST_MUTATION_CALLS" -eq 0 ] && [ -f "$_TEST_MINIO_OUT_DIR/minio-reviewer-serviceaccount.yaml" ] \
+    && pass "integrate minio: reviewer secret missing -> renders manifest, fails, zero Vault mutation" \
+    || fail "integrate minio: reviewer secret missing -> renders manifest, fails, zero Vault mutation (rc=$rc calls=$_TEST_MUTATION_CALLS)"
+unset -f kubectl
+
+# Case 3: fully ready -> Vault-side mutation DOES happen, both manifests rendered.
+kubectl() {
+    case "$*" in
+        "-n obns exec obtest-openbao-0 -c openbao -- env BAO_ADDR=https://127.0.0.1:8200 BAO_CACERT=/openbao/tls/ca.crt bao status -format=json") echo '{"sealed":false,"initialized":true}' ;;
+        "--context ready-ctx --request-timeout=10s get --raw /healthz") return 0 ;;
+        "--context ready-ctx -n vault-integration get secret obtest-vault-reviewer-token") return 0 ;;
+        "--context ready-ctx -n vault-integration get secret obtest-vault-reviewer-token -o jsonpath={.data.token}") echo -n "dG9rZW4xMjM=" ;;
+        --context\ ready-ctx\ -n\ vault-integration\ get\ secret\ obtest-vault-reviewer-token\ -o\ jsonpath=*ca*crt*) echo -n "Y2FjZXJ0" ;;
+        "--context ready-ctx config view --minify --raw -o jsonpath={.clusters[0].cluster.server}") echo -n "https://ready-ctx-api:6443" ;;
+        -n\ obns\ get\ secret\ obtest-vault-tls\ -o\ jsonpath=*tls*crt*) echo -n "dGxzY2VydA==" ;;
+        "--context ready-ctx -n minio get secret minio-credentials -o jsonpath={.data.rootUser}") return 1 ;;
+        "--context ready-ctx -n minio get secret minio-credentials -o jsonpath={.data.rootPassword}") return 1 ;;
+        *) return 1 ;;
+    esac
+}
+_TEST_MUTATION_CALLS=0
+_TEST_MINIO_OUT_DIR2="$(mktemp -d)"
+_saas_vault_integrate_minio --vault-release obtest --minio-context ready-ctx --minio-namespace minio --output-dir "$_TEST_MINIO_OUT_DIR2" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ "$_TEST_MUTATION_CALLS" -gt 0 ] && [ -f "$_TEST_MINIO_OUT_DIR2/minio-secretstore.yaml" ] && [ -f "$_TEST_MINIO_OUT_DIR2/minio-externalsecret.yaml" ] \
+    && pass "integrate minio: fully ready -> Vault mutated and manifests rendered" \
+    || fail "integrate minio: fully ready -> Vault mutated and manifests rendered (rc=$rc calls=$_TEST_MUTATION_CALLS)"
+unset -f kubectl
+unset -f _saas_vault_bao_exec _saas_vault_bao_exec_stdin
+_saas_vault_state_delete "obtest"
+_saas_vault_secrets_delete "obtest"
+rm -rf "$_TEST_MINIO_OUT_DIR" "$_TEST_MINIO_OUT_DIR2"
 
 # ------------------------------------------------------------------
 # Summary
