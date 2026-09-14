@@ -353,7 +353,7 @@ _saas_gitlab_install() {
 
     # --- StorageClass (existing cluster only) ---
     if [ "$cluster_mode" = "existing" ]; then
-        storage_class="$(_saas_gitlab_resolve_storage_class "$storage_class" "$non_interactive")" || return 1
+        storage_class="$(_saas_resolve_storage_class "$storage_class" "$non_interactive")" || return 1
     fi
 
     # Reuse existing credentials on a re-install against an already-provisioned release: the
@@ -466,7 +466,7 @@ _saas_gitlab_provision() {
     fi
 
     _saas_log_step "Configuring TLS (cert-manager)…"
-    _saas_gitlab_certmanager_ensure || return 1
+    _saas_ensure_certmanager || return 1
     case "$tls" in
         self-signed)
             _saas_gitlab_certmanager_issuer_selfsigned "$issuer_name" || return 1

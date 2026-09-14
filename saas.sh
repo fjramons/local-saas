@@ -15,6 +15,8 @@ _SAAS_ROOT_DIR="$(_saas_root_dir)"
 source "$_SAAS_ROOT_DIR/lib/common.sh"
 # shellcheck source=services/gitlab/gitlab.sh
 source "$_SAAS_ROOT_DIR/services/gitlab/gitlab.sh"
+# shellcheck source=services/vault/vault.sh
+source "$_SAAS_ROOT_DIR/services/vault/vault.sh"
 
 _saas_help() {
     cat <<'EOF'
@@ -25,11 +27,14 @@ Kubernetes.
 
 Available services:
   gitlab    Self-hosted GitLab (official Helm chart), see 'saas gitlab --help'
+  vault     Self-hosted OpenBao (alias: openbao), see 'saas vault --help'
 
 Examples:
   saas gitlab install
   saas gitlab --help
   saas gitlab install --help
+  saas vault install
+  saas openbao install --help
 EOF
 }
 
@@ -40,6 +45,9 @@ saas() {
     case "$service" in
         gitlab)
             _saas_gitlab "$@"
+            ;;
+        vault|openbao)
+            _saas_vault "$@"
             ;;
         ""|-h|--help|help)
             _saas_help

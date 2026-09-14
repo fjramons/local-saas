@@ -49,8 +49,15 @@ _saas_gitlab_datastore_ha_apply() {
         --from-literal=username=default --from-literal=password="$redis_password" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 
-    local sc_field=""
-    [ -n "$storage_class" ] && sc_field="      storageClassName: ${storage_class}"
+    # Two separate variables for the same reason as datastore.sh's sc_field_pvc/sc_field_sts: the
+    # CNPG Cluster's 'storage:' block and RedisReplication's 'volumeClaimTemplate.spec' need
+    # storageClassName at two different indentation depths. A single shared variable here was
+    # wrong at BOTH sites (verified live), never caught because --cluster-mode kind (this repo's
+    # far more exercised path) always leaves storage_class empty; only --cluster-mode existing
+    # (--mode prod) ever renders a non-empty value here.
+    local sc_field_cnpg="" sc_field_redis=""
+    [ -n "$storage_class" ] && sc_field_cnpg="    storageClassName: ${storage_class}"
+    [ -n "$storage_class" ] && sc_field_redis="        storageClassName: ${storage_class}"
 
     _saas_log_step "Provisioning CloudNativePG (3-instance PostgreSQL HA)…"
     kubectl apply -n "$ns" -f - <<EOF || return 1
@@ -74,7 +81,7 @@ spec:
       postInitSQL:
         - "CREATE DATABASE gitlabhq_production_ci;"
   storage:
-${sc_field}
+${sc_field_cnpg}
     size: 20Gi
 EOF
 
@@ -98,7 +105,7 @@ spec:
     volumeClaimTemplate:
       spec:
         accessModes: ["ReadWriteOnce"]
-${sc_field}
+${sc_field_redis}
         resources:
           requests:
             storage: 5Gi

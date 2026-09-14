@@ -114,8 +114,16 @@ _saas_gitlab_datastore_apply() {
     local psql_storage="2Gi" minio_storage="5Gi"
     local psql_cpu="200m" psql_mem="512Mi" minio_cpu="100m" minio_mem="256Mi" redis_cpu="50m" redis_mem="128Mi"
 
-    local sc_field=""
-    [ -n "$storage_class" ] && sc_field="  storageClassName: ${storage_class}"
+    # Two separate variables, not one reused at both indentation depths: this function emits
+    # storageClassName at two structurally different nesting levels (a StatefulSet's
+    # volumeClaimTemplates[].spec vs. a standalone PersistentVolumeClaim's spec), and YAML's
+    # indentation is meaningful. A single shared variable here was a real, live bug (see
+    # CLAUDE.md): correct at the standalone-PVC site, but wrong at the StatefulSet site, silently
+    # never caught because --cluster-mode kind always leaves storage_class empty (only
+    # --cluster-mode existing ever renders a non-empty value here).
+    local sc_field_pvc="" sc_field_sts=""
+    [ -n "$storage_class" ] && sc_field_pvc="  storageClassName: ${storage_class}"
+    [ -n "$storage_class" ] && sc_field_sts="        storageClassName: ${storage_class}"
 
     _saas_gitlab_datastore_secrets_apply "$ns" "$release" "$psql_password" "$minio_user" "$minio_password" || return 1
 
@@ -173,7 +181,7 @@ spec:
     - metadata: {name: data}
       spec:
         accessModes: [ReadWriteOnce]
-${sc_field}
+${sc_field_sts}
         resources: {requests: {storage: ${psql_storage}}}
 ---
 apiVersion: v1
@@ -231,7 +239,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
           args: ["server", "/data", "--console-address", ":9001"]
           ports: [{containerPort: 9000}, {containerPort: 9001}]
           env:
@@ -257,7 +265,7 @@ metadata:
   name: ${release}-minio-data
 spec:
   accessModes: [ReadWriteOnce]
-${sc_field}
+${sc_field_pvc}
   resources: {requests: {storage: ${minio_storage}}}
 ---
 apiVersion: v1
@@ -331,7 +339,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+          image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
           args: ["server", "${minio_endpoint}", "--console-address", ":9001"]
           ports: [{containerPort: 9000}, {containerPort: 9001}]
           env:
@@ -386,7 +394,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: mc
-          image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+          image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
           env:
             - name: MINIO_USER
               valueFrom: {secretKeyRef: {name: ${release}-datastore-minio, key: rootUser}}

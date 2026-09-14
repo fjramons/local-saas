@@ -1,6 +1,6 @@
 # Self-Hosted SaaS Toolkit
 
-Bash scripts to install and manage self-hosted SaaS services on Kubernetes. The entry point is the `saas` function, which dispatches to a service (`saas gitlab ...`) and that service to its own subcommands. Right now there's only one service, GitLab, but the layout is designed to add more (`saas postgres ...`, etc.) without touching what's already built.
+Bash scripts to install and manage self-hosted SaaS services on Kubernetes. The entry point is the `saas` function, which dispatches to a service (`saas gitlab ...`, `saas vault ...`) and that service to its own subcommands. Two services exist today, GitLab and Vault (self-hosted OpenBao), but the layout is designed to add more (`saas postgres ...`, etc.) without touching what's already built.
 
 ## Setup
 
@@ -165,6 +165,16 @@ saas gitlab delete                     # removes GitLab, its namespace, and (on 
 saas gitlab delete --purge-storage -y  # also removes the data; irreversible
 ```
 
+### Integrating with Vault
+
+If you also run `saas vault` (see below), it can be wired up as a secrets backend for this GitLab release, so External Secrets Operator (ESO) syncs GitLab's PostgreSQL/MinIO/object-storage credentials from Vault instead of (or alongside) the ones GitLab generates natively. All of the actual configuration happens on the Vault side (`saas vault integrate gitlab`); this repo's own role is only to apply, into this GitLab cluster, whatever manifests that command generates:
+
+```bash
+saas gitlab integrate vault
+```
+
+Safe to run at any point, even before Vault has finished its own side: it applies whichever piece is ready (first a small reviewer `ServiceAccount`, later the `SecretStore`/`ExternalSecret` pair) and tells you what to run next. See `saas vault install --integrate-gitlab --help` and `saas vault integrate gitlab --help` for the full walkthrough.
+
 ### Contextual help
 
 ```bash
@@ -185,16 +195,133 @@ bash tests/gitlab/e2e/run-tests.sh --only prod-ha          # opt-in, heavy (HA d
 
 The default E2E run covers, in order: `dev-install` (a real install, checks the ingress actually serves traffic, `credentials --verify` and `token mint` both work against the live instance, and the runner registers), `registry-push-pull`/`reinstall` (a real image push/pull, then a second `install` against the already-provisioned release), `doctor` (deliberately corrupts a MinIO Secret and checks `doctor`/`doctor --fix` detect and repair it), `registry`/`pages` (their endpoints are genuinely reachable, not just that the chart install succeeded), `duckdns` (the cert-manager webhook installs and comes up healthy; no real ACME issuance, since that needs a real DuckDNS account), `up-down` (destroy/recreate preserves the same credentials against the same data), and `ssh-config`. `prod-ha` is opt-in only (see above) and covers the HA PostgreSQL/Redis/MinIO path.
 
+## Vault
+
+Self-hosted [OpenBao](https://openbao.org/) (a Vault-compatible secrets manager) backed by its official Helm chart, with cert-manager + [Stakater Reloader](https://github.com/stakater/Reloader) as cluster prerequisites, its own internal PKI chain for the Raft/API listener, and fully automated `bao operator init`/unseal: no manual steps, no root token/unseal keys to copy-paste by hand. Also usable as `saas openbao ...`, a pure alias with no behavioral difference whatsoever.
+
+### Install on a local kind cluster (most common)
+
+```bash
+saas vault install
+```
+
+With no flags: a new kind cluster named `vault`, `dev` mode (single-node Raft, self-signed TLS, domain `vault.vault.local`), 5 Shamir key shares with a threshold of 3. To answer nothing at all:
+
+```bash
+saas vault install --non-interactive -y
+```
+
+### Install on an existing cluster, or in HA mode
+
+```bash
+saas vault versions                          # which chart versions are available
+saas vault install --mode prod \
+    --cluster-mode existing --storage-class gp3 \
+    --tls letsencrypt --challenge http01 \
+    --domain vault.mycompany.com --email me@mycompany.com
+```
+
+`--mode prod` deploys a genuine 3-replica HA Raft cluster (each node joins the other two over mTLS on its own internal, cert-manager-issued certificate), not an opt-in flag. `--tls`/`--challenge`/`--dns-provider`/`--email` control only the EXTERNAL/ingress certificate (re-encrypted to Vault's own internal-CA backend); `--dns-provider` only supports `cloudflare` here (cert-manager-native), deliberately narrower than `saas gitlab`'s DuckDNS webhook option.
+
+### Credentials: hidden by default
+
+```bash
+saas vault credentials                        # URL and seal/init status only
+saas vault credentials --reveal-root-token     # break-glass access to everything
+saas vault credentials --reveal-unseal-keys
+```
+
+Unlike `saas gitlab credentials`, the bare command never prints secret material: the root token and Shamir unseal keys are access to the *entire* secrets store, not one app's login, so they need an explicit flag. Both come from a local file only (`~/.local/state/saas/vault/<release>.keys.env`, `chmod 600`); the root token is never stored in the cluster at all.
+
+### Suspend/resume the kind cluster
+
+```bash
+saas vault down     # destroys the kind cluster
+saas vault up       # recreates the cluster and reinstalls
+```
+
+Whether the underlying Raft data survives depends on the cluster's storage: with kind's default local-path storage it typically does **not** (verified in practice: each fresh PVC binds to a fresh, empty host directory, not the old one, since kind's local-path-provisioner names directories after a random PV UID). Either way, `up` always ends with Vault initialized and unsealed again with zero manual input; if the old data didn't survive, that necessarily means a fresh root token/unseal keys too (the old ones can never unseal a store they didn't create), which `saas vault credentials --reveal-root-token` reports same as any first install.
+
+### Diagnose / repair a broken install
+
+```bash
+saas vault doctor            # report only
+saas vault doctor --fix      # apply repairs
+saas vault unseal            # manual escape hatch: re-apply saved keys to a sealed instance
+```
+
+### Integrating with GitLab or External Secrets Operator
+
+`saas vault` can be wired up so [External Secrets Operator](https://external-secrets.io/) (ESO), running in this cluster or any other, syncs secrets from it. ESO itself is never installed by this tool - only the Vault-side configuration and the manifests ESO needs are generated.
+
+**With a `saas gitlab` instance** (its own cluster, possibly a completely different one): the handshake is deliberately two-sided, since each side only ever mutates its own cluster:
+
+```bash
+# already have a GitLab instance? wire it up at install time (best-effort, never fails the install):
+saas vault install --integrate-gitlab gitlab
+
+# or standalone, at any point:
+saas vault integrate gitlab --gitlab-release gitlab
+```
+
+The first run typically stops asking you to apply a small reviewer manifest in the GitLab cluster:
+
+```bash
+saas gitlab integrate vault   # run in the gitlab cluster's own context
+saas vault integrate gitlab --gitlab-release gitlab   # re-run to finish Vault's side
+saas gitlab integrate vault   # applies the final SecretStore/ExternalSecret pair
+```
+
+Order-independent by design: running any of this before `saas gitlab` even exists yet fails cleanly with an actionable message and never leaves Vault's own configuration touched.
+
+**With any other External Secrets Operator installation**, generically (no gitlab-shaped assumptions, seeds one placeholder key purely to prove the wiring works):
+
+```bash
+saas vault integrate eso --target-context kind-my-other-cluster
+```
+
+### Contextual help
+
+```bash
+saas vault --help
+saas vault install --help
+saas vault integrate gitlab --help
+```
+
+### Tests
+
+```bash
+bash tests/vault/unit/test-argparse-values.sh                              # under 1s, no real cluster
+bash tests/vault/e2e/run-tests.sh                                          # real, creates a kind cluster, takes several minutes
+bash tests/vault/e2e/run-tests.sh --only dev-install                        # a single phase
+bash tests/vault/e2e/run-tests.sh --keep                                    # don't tear down at the end, for inspection
+bash tests/vault/e2e/run-tests.sh --only prod-ha                             # opt-in, heavy (3-replica HA Raft)
+bash tests/vault/e2e/run-tests.sh --only dev-install,integrate-gitlab-full,eso-round-trip # opt-in, heavy: full combo
+```
+
+The default E2E run covers: `dev-install` (a real install, confirms fully-automated init/unseal, the ingress genuinely serves the API, and the root token authenticates), `doctor` (deliberately reseals the instance and confirms detection/repair), `credentials-defaults` (the bare command never leaks secret material), `up-down` (ends up initialized/unsealed again regardless of whether the underlying data survived), and `integrate-gitlab-order-independence` (running the GitLab integration before any GitLab cluster exists fails cleanly and touches nothing on Vault). `prod-ha`/`integrate-gitlab-full`/`eso-round-trip` are opt-in only, each standing up a second real service.
+
 ## Repository layout
 
 ```
 saas.sh              # public dispatcher `saas SERVICE SUBCOMMAND ...`
-lib/common.sh         # shared helpers (logging, prompts, getopt)
+lib/common.sh         # shared helpers (logging, prompts, getopt, kind_cluster guard,
+                       # cert-manager ensure, StorageClass resolution - shared by every service)
 services/gitlab/       # everything GitLab-specific
   gitlab.sh             # `_saas_gitlab` dispatcher (subcommands)
-  lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install, runner, token, ssh, state, credentials, doctor
+  lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install,
+                         # runner, token, ssh, state, credentials, doctor, vault_integration
   values/               # dev/prod/datastore-ha/registry/pages .yaml.tpl overlays for the gitlab/gitlab chart
+services/vault/        # everything Vault-specific (alias: 'saas openbao')
+  vault.sh              # `_saas_vault` dispatcher (subcommands)
+  lib/                  # state, secrets, cluster, versions, operators, tls, init, install,
+                         # credentials, doctor, integration_common, gitlab_integration, eso_integration
+  values/               # dev/prod/unseal .yaml.tpl overlays for the openbao/openbao chart, plus
+                         # standalone gitlab-*/eso-*.yaml.tpl integration manifests
 tests/gitlab/
+  unit/                  # fast, no real cluster (mock kubectl/helm/kind_cluster)
+  e2e/                    # real, spin up a disposable kind cluster
+tests/vault/
   unit/                  # fast, no real cluster (mock kubectl/helm/kind_cluster)
   e2e/                    # real, spin up a disposable kind cluster
 tools/                  # standalone scripts, not part of 'saas' itself (e.g. extracting a Helm chart's real values.yaml)

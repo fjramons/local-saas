@@ -8,7 +8,7 @@ declare -a RESULTS=()
 pass() { RESULTS+=("PASS: $1"); echo "✅ PASS: $1"; }
 fail() { RESULTS+=("FAIL: $1"); echo "❌ FAIL: $1"; }
 
-# kind_cluster isn't needed for these tests (no real cluster is touched), but several files call _saas_gitlab_require_kind_cluster_fn, which only checks 'command -v kind_cluster'. We provide an empty one.
+# kind_cluster isn't needed for these tests (no real cluster is touched), but several files call the shared _saas_require_kind_cluster_fn, which only checks 'command -v kind_cluster'. We provide an empty one.
 kind_cluster() { :; }
 
 source "$REPO_ROOT/lib/common.sh"
@@ -115,19 +115,19 @@ kubectl() {
 }
 
 _TEST_SC_OUTPUT=("standard true")
-[ "$(_saas_gitlab_resolve_storage_class "" false)" = "standard" ] && pass "storage-class: uses the one marked is-default-class" || fail "storage-class: uses the one marked is-default-class"
+[ "$(_saas_resolve_storage_class "" false)" = "standard" ] && pass "storage-class: uses the one marked is-default-class" || fail "storage-class: uses the one marked is-default-class"
 
 _TEST_SC_OUTPUT=("only-one ")
-[ "$(_saas_gitlab_resolve_storage_class "" false)" = "only-one" ] && pass "storage-class: single existing one, unmarked, still used" || fail "storage-class: single existing one, unmarked"
+[ "$(_saas_resolve_storage_class "" false)" = "only-one" ] && pass "storage-class: single existing one, unmarked, still used" || fail "storage-class: single existing one, unmarked"
 
 _TEST_SC_OUTPUT=("zzz-class " "aaa-class ")
-out="$(_saas_gitlab_resolve_storage_class "" true 2>/dev/null)"
+out="$(_saas_resolve_storage_class "" true 2>/dev/null)"
 [ "$out" = "aaa-class" ] && pass "storage-class: several, no default, non-interactive -> first alphabetically" || fail "storage-class: several, no default, non-interactive (got '$out')"
 
 _TEST_SC_OUTPUT=()
-_saas_gitlab_resolve_storage_class "" true >/dev/null 2>&1 && fail "storage-class: none at all, should fail" || pass "storage-class: no StorageClass at all, fails explicitly"
+_saas_resolve_storage_class "" true >/dev/null 2>&1 && fail "storage-class: none at all, should fail" || pass "storage-class: no StorageClass at all, fails explicitly"
 
-[ "$(_saas_gitlab_resolve_storage_class "explicit" true)" = "explicit" ] && pass "storage-class: an explicit one always wins" || fail "storage-class: an explicit one always wins"
+[ "$(_saas_resolve_storage_class "explicit" true)" = "explicit" ] && pass "storage-class: an explicit one always wins" || fail "storage-class: an explicit one always wins"
 unset -f kubectl
 
 # ------------------------------------------------------------------

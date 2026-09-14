@@ -9,26 +9,10 @@ _saas_gitlab_valid_tls_mode()       { [[ "$1" == "self-signed" || "$1" == "letse
 _saas_gitlab_valid_challenge()      { [[ "$1" == "http01" || "$1" == "dns01" ]]; }
 _saas_gitlab_valid_dns_provider()   { [[ "$1" == "cloudflare" || "$1" == "duckdns" ]]; }
 
-_SAAS_GITLAB_CERTMANAGER_VERSION_HINT="see 'helm search repo jetstack/cert-manager --versions' (always latest stable, not pinned)"
-
-# _saas_gitlab_certmanager_ensure
-# Idempotent: does nothing if cert-manager is already installed (CRDs present).
-_saas_gitlab_certmanager_ensure() {
-    if kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
-        _saas_log_info "cert-manager is already installed."
-        return 0
-    fi
-
-    _saas_log_step "Installing cert-manager…"
-    if ! helm repo list -o json 2>/dev/null | jq -e '.[]? | select(.name == "jetstack")' >/dev/null; then
-        helm repo add jetstack https://charts.jetstack.io >/dev/null || return 1
-    fi
-    helm repo update jetstack >/dev/null || return 1
-
-    helm upgrade --install cert-manager jetstack/cert-manager \
-        --namespace cert-manager --create-namespace \
-        --set crds.enabled=true --wait --timeout 180s
-}
+# cert-manager's own idempotent install ("is it already there, else install latest stable") has zero
+# gitlab-specific variation, so it now lives in lib/common.sh as _saas_ensure_certmanager, shared with
+# openbao (see CLAUDE.md's Design notes). Everything below (issuers, certificate requests) stays here:
+# it genuinely differs per service (domains, SANs, which challenge types are offered).
 
 # _saas_gitlab_certmanager_issuer_selfsigned NAME
 _saas_gitlab_certmanager_issuer_selfsigned() {

@@ -3,7 +3,7 @@
 # _saas_gitlab_ssh_expose KIND_NAME NAMESPACE RELEASE HOST_PORT
 _saas_gitlab_ssh_expose() {
     local kind_name="$1" ns="$2" release="$3" host_port="$4"
-    _saas_gitlab_require_kind_cluster_fn || return 1
+    _saas_require_kind_cluster_fn || return 1
 
     local svc="${release}-gitlab-shell"
     local ip

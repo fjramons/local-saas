@@ -147,3 +147,95 @@ _saas_random_password() {
     local len="${1:-24}"
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "$len"
 }
+
+# --- Helpers below are shared by every service that manages its own kind cluster and/or
+# cert-manager-issued TLS. They started out as gitlab-only code, but a second service (openbao)
+# needs the exact same logic with zero variation, which is the point at which sharing them stops
+# being premature: the interface is already proven, not guessed at. Service-specific operators
+# (e.g. gitlab's CloudNativePG/redis-operator/DuckDNS-webhook installs) stay in their own service,
+# since those genuinely differ per service; these three don't.
+
+# _saas_require_kind_cluster_fn
+# kind_cluster is documented and maintained in the sibling bash-aliases repo; it's referenced here only by function name (never by this PC's absolute path) so as not to leak local development paths into the repo.
+_saas_require_kind_cluster_fn() {
+    if ! command -v kind_cluster >/dev/null 2>&1; then
+        _saas_log_err "The 'kind_cluster' function is not loaded in this shell."
+        _saas_log_err "--cluster-mode kind needs it to create/manage the local cluster."
+        _saas_log_err "Load 'local-cluster-functions.sh' from the bash-aliases repo before continuing."
+        return 1
+    fi
+}
+
+# _saas_resolve_storage_class [EXPLICIT] NON_INTERACTIVE
+# Resolves the StorageClass to use in --cluster-mode existing. Never fails over a resolvable ambiguity in non-interactive mode ("sensible defaults even without interactivity"); only fails if the cluster has no StorageClass at all.
+_saas_resolve_storage_class() {
+    local explicit="$1" non_interactive="$2"
+
+    if [ -n "$explicit" ]; then
+        printf '%s' "$explicit"
+        return 0
+    fi
+
+    local -a classes=()
+    local default_class=""
+    local line name is_default
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        name="${line%% *}"
+        is_default="${line#* }"
+        classes+=("$name")
+        [ "$is_default" = "true" ] && default_class="$name"
+    done < <(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' 2>/dev/null)
+
+    if [ "${#classes[@]}" -eq 0 ]; then
+        _saas_log_err "The existing cluster has no StorageClass at all, there's no reasonable choice to make."
+        _saas_log_err "Create one (or pass one with --storage-class NAME) before installing."
+        return 1
+    fi
+
+    if [ -n "$default_class" ]; then
+        printf '%s' "$default_class"
+        return 0
+    fi
+
+    if [ "${#classes[@]}" -eq 1 ]; then
+        printf '%s' "${classes[0]}"
+        return 0
+    fi
+
+    local -a sorted_classes=()
+    while IFS= read -r line; do
+        sorted_classes+=("$line")
+    done < <(printf '%s\n' "${classes[@]}" | sort)
+
+    if $non_interactive || [ ! -t 0 ]; then
+        local chosen="${sorted_classes[0]}"
+        _saas_log_warn "Multiple StorageClasses and none marked default; picking '$chosen' (first alphabetically)."
+        _saas_log_warn "Pin one explicitly with --storage-class NAME to not depend on this automatic choice."
+        printf '%s' "$chosen"
+        return 0
+    fi
+
+    _saas_prompt_menu "StorageClass to use" "${sorted_classes[0]}" false "${classes[@]}"
+}
+
+_SAAS_CERTMANAGER_VERSION_HINT="see 'helm search repo jetstack/cert-manager --versions' (always latest stable, not pinned)"
+
+# _saas_ensure_certmanager
+# Idempotent: does nothing if cert-manager is already installed (CRDs present).
+_saas_ensure_certmanager() {
+    if kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+        _saas_log_info "cert-manager is already installed."
+        return 0
+    fi
+
+    _saas_log_step "Installing cert-manager…"
+    if ! helm repo list -o json 2>/dev/null | jq -e '.[]? | select(.name == "jetstack")' >/dev/null; then
+        helm repo add jetstack https://charts.jetstack.io >/dev/null || return 1
+    fi
+    helm repo update jetstack >/dev/null || return 1
+
+    helm upgrade --install cert-manager jetstack/cert-manager \
+        --namespace cert-manager --create-namespace \
+        --set crds.enabled=true --wait --timeout 180s
+}
