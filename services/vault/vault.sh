@@ -33,6 +33,8 @@ source "$_SAAS_VAULT_DIR/lib/gitlab_integration.sh"
 source "$_SAAS_VAULT_DIR/lib/eso_integration.sh"
 # shellcheck source=lib/minio_integration.sh
 source "$_SAAS_VAULT_DIR/lib/minio_integration.sh"
+# shellcheck source=lib/postgres_integration.sh
+source "$_SAAS_VAULT_DIR/lib/postgres_integration.sh"
 
 _saas_vault_integrate_help() {
     cat <<'EOF'
@@ -43,6 +45,8 @@ Targets:
            'saas vault integrate gitlab --help'
   minio    Wire this Vault release up for a MinIO instance, see
            'saas vault integrate minio --help'
+  postgres Wire this Vault release up for a postgres instance, see
+           'saas vault integrate postgres --help'
   eso      Wire this Vault release up for an arbitrary External
            Secrets Operator installation, see 'saas vault integrate
            eso --help'
@@ -53,9 +57,10 @@ _saas_vault_integrate() {
     local target="${1:-}"
     [ $# -gt 0 ] && shift
     case "$target" in
-        gitlab) _saas_vault_integrate_gitlab "$@" ;;
-        minio)  _saas_vault_integrate_minio "$@" ;;
-        eso)    _saas_vault_integrate_eso "$@" ;;
+        gitlab)   _saas_vault_integrate_gitlab "$@" ;;
+        minio)    _saas_vault_integrate_minio "$@" ;;
+        postgres) _saas_vault_integrate_postgres "$@" ;;
+        eso)      _saas_vault_integrate_eso "$@" ;;
         ""|-h|--help|help)
             _saas_vault_integrate_help
             ;;
@@ -97,6 +102,7 @@ Examples:
   saas vault credentials
   saas vault integrate gitlab --gitlab-release gitlab
   saas vault integrate minio --minio-release minio
+  saas vault integrate postgres --postgres-release postgres
   saas vault down
   saas vault up
   saas vault doctor

@@ -4,6 +4,7 @@
 
 _saas_gitlab_valid_mode()   { [[ "$1" == "dev" || "$1" == "prod" ]]; }
 _saas_gitlab_valid_object_storage_mode() { [[ "$1" == "internal" || "$1" == "external" ]]; }
+_saas_gitlab_valid_database_mode() { [[ "$1" == "internal" || "$1" == "external" ]]; }
 _saas_gitlab_valid_bool()   { [[ "$1" == "true" || "$1" == "false" ]]; }
 _saas_gitlab_valid_hostport() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 _saas_gitlab_valid_workers()  { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -55,6 +56,8 @@ Options:
       --mode MODE               dev (default) or prod, see 'Modes'
       --object-storage MODE      internal (default) or external, see
                                 'External object storage' below
+      --database MODE            internal (default) or external, see
+                                'External database' below
       --version VERSION         Version of the gitlab/gitlab chart, or
                                 'latest' (default). See 'saas gitlab
                                 versions'.
@@ -146,6 +149,20 @@ External object storage (--object-storage):
              PostgreSQL/Redis stay internal either way; only object
              storage is ever externalized.
 
+External database (--database):
+  internal   Deploys this release's own private PostgreSQL (default,
+             unchanged behavior): --mode dev's single instance or
+             --mode prod's CloudNativePG-managed HA Cluster.
+  external   Uses a shared PostgreSQL instance managed by 'saas
+             postgres' instead. Requires the datastore Secret
+             ('<release>-datastore-psql') to already exist in this
+             release's namespace: run 'saas postgres integrate
+             gitlab' then 'saas gitlab integrate postgres' FIRST
+             (this install refuses to proceed otherwise, with that
+             exact instruction). Redis (and, independently,
+             --object-storage) stay on their own default/chosen mode
+             either way; --database only ever affects PostgreSQL.
+
 Options with no safe default (asked with no suggestion, and DO fail in
 --non-interactive if missing, there's no reasonable automatic choice):
   --domain (with --tls letsencrypt), --email (with --tls letsencrypt),
@@ -168,7 +185,7 @@ EOF
 _saas_gitlab_install() {
     local release="" namespace="" cluster_mode="kind" kind_name="" kind_workers="0"
     local storage_mode="local-path" storage_class=""
-    local mode="dev" object_storage_mode="internal" version="latest" domain="" tls="" force_self_signed_prod=false
+    local mode="dev" object_storage_mode="internal" database_mode="internal" version="latest" domain="" tls="" force_self_signed_prod=false
     local challenge="" dns_provider="cloudflare" dns_token="" email=""
     local ingress_class="nginx" ssh_host_port="2222" runner_enabled=true
     local registry_enabled=true pages_enabled=false pages_url_mode="path"
@@ -176,13 +193,13 @@ _saas_gitlab_install() {
 
     local release_set=false namespace_set=false cluster_mode_set=false kind_name_set=false
     local kind_workers_set=false storage_mode_set=false storage_class_set=false
-    local mode_set=false object_storage_mode_set=false version_set=false domain_set=false tls_set=false
+    local mode_set=false object_storage_mode_set=false database_mode_set=false version_set=false domain_set=false tls_set=false
     local challenge_set=false dns_provider_set=false ingress_class_set=false
     local ssh_host_port_set=false runner_set=false registry_set=false pages_set=false
     local pages_url_mode_set=false
 
     local args
-    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,object-storage:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,registry,no-registry,pages,no-pages,pages-url-mode:,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
+    args=$(getopt -o yh -l release:,namespace:,cluster-mode:,kind-name:,kind-workers:,storage-mode:,storage-class:,mode:,object-storage:,database:,version:,domain:,tls:,force-self-signed-prod,challenge:,dns-provider:,dns-token:,email:,ingress-class:,ssh-host-port:,runner,no-runner,registry,no-registry,pages,no-pages,pages-url-mode:,yes,non-interactive,help --name saas_gitlab_install -- "$@") || {
         _saas_gitlab_install_help; return 1
     }
     eval set -- "$args"
@@ -197,6 +214,7 @@ _saas_gitlab_install() {
             --storage-class)      storage_class="$2"; storage_class_set=true; shift 2 ;;
             --mode)                mode="$2"; mode_set=true; shift 2 ;;
             --object-storage)      object_storage_mode="$2"; object_storage_mode_set=true; shift 2 ;;
+            --database)             database_mode="$2"; database_mode_set=true; shift 2 ;;
             --version)             version="$2"; version_set=true; shift 2 ;;
             --domain)               domain="$2"; domain_set=true; shift 2 ;;
             --tls)                  tls="$2"; tls_set=true; shift 2 ;;
@@ -296,6 +314,47 @@ _saas_gitlab_install() {
             _saas_log_err "Bootstrap first with a normal install (--object-storage internal, the default), then run 'saas minio integrate gitlab'/'saas gitlab integrate minio', then reinstall with --object-storage external."
             return 1
         fi
+    fi
+
+    # --- database mode ---
+    $database_mode_set || database_mode="$(_saas_prompt_menu "Database" "internal" "$non_interactive" internal external)"
+    _saas_gitlab_valid_database_mode "$database_mode" || { _saas_log_err "--database must be 'internal' or 'external'."; return 1; }
+    local database_host="" database_port="5432"
+    if [ "$database_mode" = "external" ]; then
+        # Same "bootstrap internal first" ordering constraint as --object-storage external, see
+        # above: on --cluster-mode kind's very first install there's no cluster to check yet.
+        local _db_cluster_ready=true
+        if [ "$cluster_mode" = "kind" ]; then
+            if _saas_gitlab_cluster_exists "$kind_name"; then
+                _saas_gitlab_cluster_use "$kind_name" || _db_cluster_ready=false
+            else
+                _db_cluster_ready=false
+            fi
+        fi
+        if $_db_cluster_ready; then
+            kubectl -n "$namespace" get secret "${release}-datastore-psql" >/dev/null 2>&1 || {
+                _saas_log_err "--database external requires the '${release}-datastore-psql' Secret to already exist in namespace '$namespace'."
+                _saas_log_err "Run 'saas postgres integrate gitlab --gitlab-release $release' then 'saas gitlab integrate postgres --release $release' first."
+                return 1
+            }
+        else
+            _saas_log_err "--database external needs the kind cluster '$kind_name' to already exist (its own first install cannot pre-create the datastore Secret)."
+            _saas_log_err "Bootstrap first with a normal install (--database internal, the default), then run 'saas postgres integrate gitlab'/'saas gitlab integrate postgres', then reinstall with --database external."
+            return 1
+        fi
+        # Read the host/port folded into gitlab's own saved state by 'saas gitlab integrate
+        # postgres' (services/gitlab/lib/postgres_integration.sh): unlike the object-storage
+        # Secrets, the chart needs these as Helm values (global.psql.host/.port), not something
+        # embeddable inside the Secret itself.
+        if _saas_gitlab_state_load "$release" 2>/dev/null; then
+            database_host="${SAAS_GITLAB_STATE_DATABASE_HOST:-}"
+            database_port="${SAAS_GITLAB_STATE_DATABASE_PORT:-5432}"
+        fi
+        [ -n "$database_host" ] || {
+            _saas_log_err "No external database host/port saved for release '$release'."
+            _saas_log_err "Run 'saas gitlab integrate postgres --release $release' first (it saves the connection info this install needs)."
+            return 1
+        }
     fi
 
     # --- chart version ---
@@ -430,7 +489,7 @@ _saas_gitlab_install() {
         "$challenge" "$dns_provider" "$dns_token" "$email" "$ingress_class" "$ssh_host_port" \
         "$runner_enabled" "$registry_enabled" "$pages_enabled" "$pages_url_mode" \
         "$psql_password" "$minio_user" "$minio_password" "$root_password" "$redis_password" \
-        "$object_storage_mode"
+        "$object_storage_mode" "$database_mode" "$database_host" "$database_port"
 }
 
 # _saas_gitlab_provision RELEASE NAMESPACE CLUSTER_MODE KIND_NAME KIND_WORKERS \
@@ -457,16 +516,18 @@ _saas_gitlab_issue_letsencrypt_dns01() {
     esac
 }
 
-# _saas_gitlab_render_values_layer SRC DOMAIN RELEASE NAMESPACE INGRESS_CLASS TLS_SECRET [PAGES_NAMESPACE_IN_PATH]
-# Renders one values template (envsubst) into a fresh temp file, printing its path on stdout. Several of these get layered as successive '-f' arguments to 'helm upgrade --install' (see _saas_gitlab_provision): base mode overlay, then optional datastore-ha/registry/pages fragments, in that order, so a later one's keys win over an earlier one's on overlap. PAGES_NAMESPACE_IN_PATH defaults to "true" (its value only matters to the pages.yaml.tpl layer; every other caller/template ignores it).
+# _saas_gitlab_render_values_layer SRC DOMAIN RELEASE NAMESPACE INGRESS_CLASS TLS_SECRET [PAGES_NAMESPACE_IN_PATH] [PSQL_HOST] [PSQL_PORT]
+# Renders one values template (envsubst) into a fresh temp file, printing its path on stdout. Several of these get layered as successive '-f' arguments to 'helm upgrade --install' (see _saas_gitlab_provision): base mode overlay, then optional datastore-ha/registry/pages/database-external fragments, in that order, so a later one's keys win over an earlier one's on overlap. PAGES_NAMESPACE_IN_PATH defaults to "true" (its value only matters to the pages.yaml.tpl layer). PSQL_HOST/PSQL_PORT only matter to database-external.yaml.tpl; every other caller/template ignores all three.
 _saas_gitlab_render_values_layer() {
     local src="$1" domain="$2" release="$3" namespace="$4" ingress_class="$5" tls_secret="$6" pages_namespace_in_path="${7:-true}"
+    local psql_host="${8:-}" psql_port="${9:-}"
     local out
     out="$(mktemp "${TMPDIR:-/tmp}/saas-gitlab-values-XXXXXX.yaml")" || return 1
     SAAS_DOMAIN="$domain" SAAS_RELEASE="$release" SAAS_NAMESPACE="$namespace" \
         SAAS_INGRESS_CLASS="$ingress_class" SAAS_TLS_SECRET="$tls_secret" \
         SAAS_PAGES_NAMESPACE_IN_PATH="$pages_namespace_in_path" \
-        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET} ${SAAS_PAGES_NAMESPACE_IN_PATH}' \
+        SAAS_PSQL_HOST="$psql_host" SAAS_PSQL_PORT="$psql_port" \
+        envsubst '${SAAS_DOMAIN} ${SAAS_RELEASE} ${SAAS_NAMESPACE} ${SAAS_INGRESS_CLASS} ${SAAS_TLS_SECRET} ${SAAS_PAGES_NAMESPACE_IN_PATH} ${SAAS_PSQL_HOST} ${SAAS_PSQL_PORT}' \
         < "$src" > "$out" || return 1
     echo "$out"
 }
@@ -478,6 +539,7 @@ _saas_gitlab_provision() {
     local runner_enabled="${19}" registry_enabled="${20}" pages_enabled="${21}" pages_url_mode="${22}"
     local psql_password="${23}" minio_user="${24}" minio_password="${25}" root_password="${26}" redis_password="${27}"
     local object_storage_mode="${28:-internal}"
+    local database_mode="${29:-internal}" database_host="${30:-}" database_port="${31:-5432}"
 
     [ -n "$psql_password" ] || psql_password="$(_saas_random_password 32)"
     [ -n "$minio_user" ]    || minio_user="gitlab-minio"
@@ -491,6 +553,7 @@ _saas_gitlab_provision() {
         "PSQL_PASSWORD=$psql_password" "MINIO_ROOT_USER=$minio_user" "MINIO_ROOT_PASSWORD=$minio_password" \
         "ROOT_PASSWORD=$root_password" "REDIS_PASSWORD=$redis_password" \
         "OBJECT_STORAGE_MODE=$object_storage_mode" \
+        "DATABASE_MODE=$database_mode" "DATABASE_HOST=$database_host" "DATABASE_PORT=$database_port" \
         "STATUS=provisioning"
 
     local -a extra_sans=()
@@ -514,11 +577,11 @@ _saas_gitlab_provision() {
 
     if [ "$mode" = "prod" ]; then
         _saas_log_step "Deploying HA PostgreSQL/Redis$([ "$object_storage_mode" = "internal" ] && echo /MinIO)…"
-        _saas_gitlab_datastore_ha_apply "$namespace" "$release" "$storage_class" "$object_storage_mode" \
+        _saas_gitlab_datastore_ha_apply "$namespace" "$release" "$storage_class" "$object_storage_mode" "$database_mode" \
             "$psql_password" "$minio_user" "$minio_password" "$redis_password" || return 1
     else
         _saas_log_step "Deploying our own PostgreSQL/Redis$([ "$object_storage_mode" = "internal" ] && echo /MinIO)…"
-        _saas_gitlab_datastore_apply "$namespace" "$release" "$storage_class" "$object_storage_mode" \
+        _saas_gitlab_datastore_apply "$namespace" "$release" "$storage_class" "$object_storage_mode" "$database_mode" \
             "$psql_password" "$minio_user" "$minio_password" || return 1
     fi
 
@@ -576,6 +639,10 @@ _saas_gitlab_provision() {
         layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/pages.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$pages_tls_secret" "$pages_namespace_in_path")" || { rm -f "${rendered_files[@]}"; return 1; }
         rendered_files+=("$layer"); value_files+=(-f "$layer")
     fi
+    if [ "$database_mode" = "external" ]; then
+        layer="$(_saas_gitlab_render_values_layer "$_SAAS_GITLAB_DIR/values/database-external.yaml.tpl" "$domain" "$release" "$namespace" "$ingress_class" "$tls_secret" "true" "$database_host" "$database_port")" || { rm -f "${rendered_files[@]}"; return 1; }
+        rendered_files+=("$layer"); value_files+=(-f "$layer")
+    fi
 
     helm upgrade --install "$release" gitlab/gitlab \
         --namespace "$namespace" --create-namespace \
@@ -608,6 +675,7 @@ _saas_gitlab_provision() {
         "PSQL_PASSWORD=$psql_password" "MINIO_ROOT_USER=$minio_user" "MINIO_ROOT_PASSWORD=$minio_password" \
         "ROOT_PASSWORD=$root_password" "REDIS_PASSWORD=$redis_password" \
         "OBJECT_STORAGE_MODE=$object_storage_mode" \
+        "DATABASE_MODE=$database_mode" "DATABASE_HOST=$database_host" "DATABASE_PORT=$database_port" \
         "STATUS=up"
 
     _saas_log_ok "GitLab '$release' is ready."
@@ -663,7 +731,8 @@ _saas_gitlab_up() {
         "${SAAS_GITLAB_STATE_PAGES_URL_MODE:-path}" \
         "$SAAS_GITLAB_STATE_PSQL_PASSWORD" "$SAAS_GITLAB_STATE_MINIO_ROOT_USER" \
         "$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_ROOT_PASSWORD" "$SAAS_GITLAB_STATE_REDIS_PASSWORD" \
-        "${SAAS_GITLAB_STATE_OBJECT_STORAGE_MODE:-internal}"
+        "${SAAS_GITLAB_STATE_OBJECT_STORAGE_MODE:-internal}" \
+        "${SAAS_GITLAB_STATE_DATABASE_MODE:-internal}" "$SAAS_GITLAB_STATE_DATABASE_HOST" "${SAAS_GITLAB_STATE_DATABASE_PORT:-5432}"
 }
 
 _saas_gitlab_down_help() {
@@ -717,6 +786,7 @@ _saas_gitlab_down() {
         "PSQL_PASSWORD=$SAAS_GITLAB_STATE_PSQL_PASSWORD" "MINIO_ROOT_USER=$SAAS_GITLAB_STATE_MINIO_ROOT_USER" "MINIO_ROOT_PASSWORD=$SAAS_GITLAB_STATE_MINIO_ROOT_PASSWORD" \
         "ROOT_PASSWORD=$SAAS_GITLAB_STATE_ROOT_PASSWORD" "REDIS_PASSWORD=$SAAS_GITLAB_STATE_REDIS_PASSWORD" \
         "OBJECT_STORAGE_MODE=${SAAS_GITLAB_STATE_OBJECT_STORAGE_MODE:-internal}" \
+        "DATABASE_MODE=${SAAS_GITLAB_STATE_DATABASE_MODE:-internal}" "DATABASE_HOST=$SAAS_GITLAB_STATE_DATABASE_HOST" "DATABASE_PORT=${SAAS_GITLAB_STATE_DATABASE_PORT:-5432}" \
         "STATUS=down"
     _saas_log_ok "kind cluster '$SAAS_GITLAB_STATE_KIND_NAME' destroyed. Data preserved. Use 'saas gitlab up $release' to bring it back up."
 }
@@ -801,6 +871,7 @@ _saas_gitlab_status() {
     echo "Cluster:        $SAAS_GITLAB_STATE_CLUSTER_MODE${SAAS_GITLAB_STATE_KIND_NAME:+ ($SAAS_GITLAB_STATE_KIND_NAME)}"
     echo "Mode:           $SAAS_GITLAB_STATE_MODE"
     echo "Object storage: ${SAAS_GITLAB_STATE_OBJECT_STORAGE_MODE:-internal}"
+    echo "Database:       ${SAAS_GITLAB_STATE_DATABASE_MODE:-internal}"
     echo "Chart version:  $SAAS_GITLAB_STATE_VERSION"
     echo "Domain:         $SAAS_GITLAB_STATE_DOMAIN"
     echo "TLS:            $SAAS_GITLAB_STATE_TLS"

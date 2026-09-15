@@ -492,6 +492,13 @@ _saas_gitlab_valid_object_storage_mode "internal" && pass "valid_object_storage_
 _saas_gitlab_valid_object_storage_mode "external" && pass "valid_object_storage_mode accepts 'external'" || fail "valid_object_storage_mode accepts 'external'"
 _saas_gitlab_valid_object_storage_mode "s3" && fail "valid_object_storage_mode rejects 's3'" || pass "valid_object_storage_mode rejects 's3'"
 
+# --database (--database internal|external): same shape/precedent as --object-storage above, but
+# gating the private PostgreSQL StatefulSet/CNPG Cluster instead of MinIO (see datastore.sh/
+# datastore-ha.sh); Redis stays internal either way, independently of both flags.
+_saas_gitlab_valid_database_mode "internal" && pass "valid_database_mode accepts 'internal'" || fail "valid_database_mode accepts 'internal'"
+_saas_gitlab_valid_database_mode "external" && pass "valid_database_mode accepts 'external'" || fail "valid_database_mode accepts 'external'"
+_saas_gitlab_valid_database_mode "postgresql" && fail "valid_database_mode rejects 'postgresql'" || pass "valid_database_mode rejects 'postgresql'"
+
 # 'create secret ... | kubectl apply -f -' runs its LEFT side in a subshell (the documented pipe
 # gotcha, see e.g. the vault unit test's unseal_secret_apply case): a plain variable set from
 # inside the mocked kubectl there would be lost the instant that subshell exits, so capture to a

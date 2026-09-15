@@ -21,6 +21,8 @@ source "$_SAAS_ROOT_DIR/services/gitlab/gitlab.sh"
 source "$_SAAS_ROOT_DIR/services/vault/vault.sh"
 # shellcheck source=services/minio/minio.sh
 source "$_SAAS_ROOT_DIR/services/minio/minio.sh"
+# shellcheck source=services/postgres/postgres.sh
+source "$_SAAS_ROOT_DIR/services/postgres/postgres.sh"
 
 _saas_help() {
     cat <<'EOF'
@@ -36,6 +38,8 @@ Available services:
   vault     Self-hosted OpenBao (alias: openbao), see 'saas vault --help'
   minio     Standalone S3-compatible object storage (alias: object-storage),
             see 'saas minio --help'
+  postgres  Standalone PostgreSQL database (alias: postgresql), see
+            'saas postgres --help'
 
 Examples:
   saas cluster create
@@ -47,6 +51,8 @@ Examples:
   saas openbao install --help
   saas minio install
   saas object-storage install --help
+  saas postgres install
+  saas postgresql install --help
 EOF
 }
 
@@ -66,6 +72,9 @@ saas() {
             ;;
         minio|object-storage)
             _saas_minio "$@"
+            ;;
+        postgres|postgresql)
+            _saas_postgres "$@"
             ;;
         ""|-h|--help|help)
             _saas_help

@@ -14,7 +14,6 @@
 # embedded-sentinel path). Sentinel only exposes topology/monitoring info, never data, so this is judged an
 # acceptable trade-off. Revisit once that issue is fixed upstream.
 
-_SAAS_GITLAB_CNPG_POSTGRESQL_IMAGE="ghcr.io/cloudnative-pg/postgresql:17"
 _SAAS_GITLAB_REDIS_OPERATOR_REDIS_IMAGE="quay.io/opstree/redis:v7.2.16"
 _SAAS_GITLAB_REDIS_OPERATOR_SENTINEL_IMAGE="quay.io/opstree/redis-sentinel:v7.2.16"
 
@@ -34,18 +33,18 @@ _saas_gitlab_wait_for_resource() {
     done
 }
 
-# _saas_gitlab_datastore_ha_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD REDIS_PASSWORD
+# _saas_gitlab_datastore_ha_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE DATABASE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD REDIS_PASSWORD
 # OBJECT_STORAGE_MODE: see datastore.sh's _saas_gitlab_datastore_apply for the 'internal'/'external'
 # split; here it gates the 4-node distributed MinIO at the bottom of this function instead of the
-# single-instance one.
+# single-instance one. DATABASE_MODE: same split, gates the CNPG Cluster below instead; 'external'
+# skips it entirely, relying on the Secret 'saas gitlab integrate postgres' already applied. Redis
+# is never affected by either flag, always deployed internally (HA) here.
 _saas_gitlab_datastore_ha_apply() {
-    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4"
-    local psql_password="$5" minio_user="$6" minio_password="$7" redis_password="$8"
+    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4" database_mode="$5"
+    local psql_password="$6" minio_user="$7" minio_password="$8" redis_password="$9"
 
-    _saas_gitlab_operator_cnpg_ensure || return 1
     _saas_gitlab_operator_redis_ensure || return 1
 
-    _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
     if [ "$object_storage_mode" = "internal" ]; then
         _saas_gitlab_datastore_minio_secrets_apply "$ns" "$release" "$minio_user" "$minio_password" || return 1
     fi
@@ -65,15 +64,19 @@ _saas_gitlab_datastore_ha_apply() {
     [ -n "$storage_class" ] && sc_field_cnpg="    storageClassName: ${storage_class}"
     [ -n "$storage_class" ] && sc_field_redis="        storageClassName: ${storage_class}"
 
-    _saas_log_step "Provisioning CloudNativePG (3-instance PostgreSQL HA)…"
-    kubectl apply -n "$ns" -f - <<EOF || return 1
+    if [ "$database_mode" = "internal" ]; then
+        _saas_gitlab_operator_cnpg_ensure || return 1
+        _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
+
+        _saas_log_step "Provisioning CloudNativePG (3-instance PostgreSQL HA)…"
+        kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
   name: ${release}-postgresql
 spec:
   instances: 3
-  imageName: ${_SAAS_GITLAB_CNPG_POSTGRESQL_IMAGE}
+  imageName: ${_SAAS_CNPG_POSTGRESQL_IMAGE}
   postgresql:
     parameters:
       max_locks_per_transaction: "256"
@@ -91,8 +94,11 @@ ${sc_field_cnpg}
     size: 20Gi
 EOF
 
-    _saas_log_wait "Waiting for the CloudNativePG cluster to become Ready…"
-    kubectl -n "$ns" wait --for=condition=Ready --timeout=300s "cluster/${release}-postgresql" || return 1
+        _saas_log_wait "Waiting for the CloudNativePG cluster to become Ready…"
+        kubectl -n "$ns" wait --for=condition=Ready --timeout=300s "cluster/${release}-postgresql" || return 1
+    else
+        _saas_log_info "Database: external (managed by 'saas postgres'), no private PostgreSQL deployed here."
+    fi
 
     _saas_log_step "Provisioning Redis Sentinel HA (redis-operator)…"
     kubectl apply -n "$ns" -f - <<EOF || return 1

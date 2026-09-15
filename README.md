@@ -233,6 +233,18 @@ saas gitlab install --object-storage external           # (re)install pointing a
 
 Unlike the Vault handshake above, this is a single round trip, not two-phase: handing GitLab a set of static connection Secrets needs no cross-cluster authentication trust the way ESO does, so there's no reviewer manifest to apply back and forth. On a brand new `--cluster-mode kind` install, the kind cluster has to exist before `saas minio integrate gitlab` can create the buckets/Secrets in it, so bootstrap with a normal install first (`--object-storage internal`, the default), then integrate, then reinstall with `--object-storage external` (idempotent, same credential-reuse behavior as any other reinstall). `--cluster-mode existing` has no such ordering constraint, since the cluster/namespace are already reachable from the start.
 
+### External database (PostgreSQL)
+
+By default GitLab deploys its own private PostgreSQL (a single instance in `--mode dev`, a CloudNativePG-managed 3-instance HA `Cluster` in `--mode prod`). `--database external` replaces it with a shared `saas postgres` instance instead (see the PostgreSQL section below), independent of `--object-storage`: any combination of internal/external database and object storage is valid. Redis always stays internal to `saas gitlab` either way; only PostgreSQL is ever externalized by this flag.
+
+```bash
+saas postgres integrate gitlab --gitlab-release gitlab   # run in the postgres cluster's own context
+saas gitlab integrate postgres                            # applies the datastore Secret here
+saas gitlab install --database external                    # (re)install pointing at the shared postgres
+```
+
+Same single-round-trip shape as the MinIO integration above (a static connection Secret, no cross-cluster authentication trust needed). `saas postgres integrate gitlab` creates the `gitlabhq_production`/`gitlabhq_production_ci` databases and a `gitlab` role on the shared postgres, generating (and, on a re-run, reusing) its own password; `saas gitlab integrate postgres` applies the resulting Secret plus the connection host/port. Same bootstrap-order constraint as MinIO's own integration on a brand new `--cluster-mode kind` install: bootstrap with a normal install first (`--database internal`, the default), integrate, then reinstall with `--database external`.
+
 ### Contextual help
 
 ```bash
@@ -487,6 +499,147 @@ bash tests/minio/e2e/run-tests.sh --only dev-install,integrate-gitlab-full  # op
 
 The default E2E run covers: `dev-install` (a real install, a real bucket create/list/rm round trip, `credentials --verify` against the live instance), `doctor` (deliberately drifts the root-credentials Secret and confirms detection/repair), and `up-down` (buckets/credentials survive or are idempotently recreated). `prod-ha`/`integrate-vault-full`/`integrate-gitlab-full` are opt-in only, each standing up a second real service (or, for `prod-ha`, a second MinIO release).
 
+## PostgreSQL
+
+Standalone PostgreSQL, deployed with plain manifests in `--mode dev` (single instance, no chart) and via the [CloudNativePG](https://cloudnative-pg.io/) operator in `--mode prod` (real 3-instance HA, the same operator `saas gitlab --mode prod` already uses for its own HA PostgreSQL). Also usable as `saas postgresql ...`, a pure alias with no behavioral difference whatsoever. Unlike GitLab's own private PostgreSQL (still the default there, and deliberately left plaintext, since it's never meant to be reached the way a shared instance is), this service enforces TLS on every connection in both modes: a plaintext connection attempt is rejected outright, not just discouraged.
+
+### Install on a local kind cluster (most common)
+
+```bash
+saas postgres install
+```
+
+With no flags: a new kind cluster named `postgres`, `dev` mode (single instance, self-signed TLS, admin role `admin`), no databases pre-created. To answer nothing at all:
+
+```bash
+saas postgres install --non-interactive -y
+```
+
+To pre-create databases at install time:
+
+```bash
+saas postgres install --release demo --database photos --database backups
+```
+
+The default admin role is `admin`, not `postgres`: CloudNativePG (`--mode prod`) reserves the name `postgres` for its own internal superuser, whose password this tool deliberately never manages, so `admin` is the one name that works identically and correctly as an ordinary role in both modes.
+
+### Install on an existing cluster, or in HA mode
+
+```bash
+saas postgres install --mode prod \
+    --cluster-mode existing --storage-class gp3 \
+    --tls letsencrypt --challenge http01 \
+    --domain postgres.mycompany.com --email me@mycompany.com
+```
+
+`--mode prod` deploys a genuine 3-instance CloudNativePG-managed `Cluster` (real automatic failover), not an opt-in flag. `--dns-provider` only supports `cloudflare` here (cert-manager-native), same deliberately-narrower-than-GitLab choice `saas vault`/`saas minio` already make.
+
+### Databases
+
+```bash
+saas postgres database create my-app
+saas postgres database create gitlabhq_production --owner gitlab
+saas postgres database list
+saas postgres database drop my-app -y
+```
+
+With no `--owner`, a new database is simply owned by the release's own admin role. `--owner NAME` creates (idempotently, reusing an already-persisted password on a re-run) a dedicated role plus a companion `<release>-<owner>-credentials` Secret (same `kubernetes.io/basic-auth` shape as `<release>-credentials`), for callers that want isolation: exactly the shape `saas postgres integrate gitlab` itself uses for GitLab's own `gitlab` role.
+
+### Connecting from the host
+
+```bash
+saas postgres install --expose --host-port 15432
+psql "host=127.0.0.1 port=15432 sslmode=require"
+```
+
+Off by default: this service's primary consumers are other SaaS services running inside the cluster (most notably `saas gitlab`), not a host client. `--expose` (kind-mode only) publishes the Service on a host port via the same socat-proxy mechanism `saas gitlab`'s own SSH exposure uses, backed by a real `LoadBalancer` Service (MetalLB-assigned, installed by `saas cluster create` by default) so the proxy container can actually reach it, since a plain `ClusterIP` isn't reachable that way. Not yet supported together with `--mode prod` (CloudNativePG manages its own Services; this tool doesn't wire a `LoadBalancer` override for them in this version).
+
+### Credentials
+
+```bash
+saas postgres credentials
+saas postgres credentials --verify   # also checks the saved credentials authenticate live
+```
+
+Prints the in-cluster connection string, the external host:port (if `--expose` was used), and the admin username/password, in plain (like `saas gitlab credentials`/`saas minio credentials`, not gated behind a reveal flag the way `saas vault credentials` is).
+
+### Diagnose / repair a broken install
+
+```bash
+saas postgres doctor            # report only, nothing is changed
+saas postgres doctor --fix      # apply repairs
+```
+
+Checks for pods stuck in `Unknown` phase and the admin password drifting from the live database (`--mode dev` only; `--mode prod`'s CloudNativePG-managed `Cluster` reconciles its own credentials continuously and isn't covered). `--fix` is required to actually apply any repair. This is also the command to run after a Vault-driven credential rotation (see "Integrating with Vault" below): unlike MinIO, a PostgreSQL role's real password is a database-level fact, not something a pod restart alone changes.
+
+### Suspend/resume the kind cluster
+
+```bash
+saas postgres down     # destroys the kind cluster; data is preserved on the host
+saas postgres up       # recreates the cluster and reinstalls, pre-created databases re-created idempotently
+```
+
+### Status / uninstall
+
+```bash
+saas postgres status
+saas postgres delete                     # removes postgres, its namespace, and (on kind) the cluster
+saas postgres delete --purge-storage -y  # also removes the data; irreversible
+```
+
+### Integrating with Vault
+
+`saas vault` can manage and rotate this release's admin credentials (see the Vault section above for the full two-sided walkthrough):
+
+```bash
+saas vault integrate postgres --postgres-release postgres
+saas postgres integrate vault
+```
+
+### Integrating with GitLab
+
+Lets a `saas gitlab` install use this postgres instead of deploying its own private one (see "External database (PostgreSQL)" in the GitLab section above for the full walkthrough):
+
+```bash
+saas postgres integrate gitlab --gitlab-release gitlab
+saas gitlab integrate postgres
+saas gitlab install --database external
+```
+
+Creates GitLab's expected `gitlabhq_production`/`gitlabhq_production_ci` databases and a `gitlab` role here, and hands GitLab a static connection Secret plus the host/port: a single round trip, no reviewer-ServiceAccount handshake needed (unlike the Vault integration, which needs one to establish cross-cluster authentication trust for ESO). If postgres and GitLab share the same cluster (different namespaces, the realistic single-machine setup), GitLab connects over postgres's internal Service address; across genuinely separate clusters, this postgres release must have been installed with `--expose` first, a less-tested path.
+
+A full, runnable example from scratch:
+
+```bash
+saas postgres install --release pg --mode dev --tls self-signed --non-interactive -y
+saas postgres database create myapp --release pg
+saas postgres integrate gitlab --postgres-release pg --gitlab-release gitlab
+saas gitlab integrate postgres --release gitlab --postgres-release pg
+saas gitlab install --release gitlab --database external --non-interactive -y
+```
+
+### Contextual help
+
+```bash
+saas postgres --help
+saas postgres install --help
+saas postgres database --help
+```
+
+### Tests
+
+```bash
+bash tests/postgres/unit/test-argparse-values.sh                              # under 1s, no real cluster
+bash tests/postgres/e2e/run-tests.sh                                         # real, creates a kind cluster, takes several minutes
+bash tests/postgres/e2e/run-tests.sh --only dev-install                       # a single phase
+bash tests/postgres/e2e/run-tests.sh --keep                                   # don't tear down at the end, for inspection
+bash tests/postgres/e2e/run-tests.sh --only prod-ha                            # opt-in, heavy (CloudNativePG 3-instance HA)
+bash tests/postgres/e2e/run-tests.sh --only dev-install,integrate-vault-full   # opt-in, heavy
+bash tests/postgres/e2e/run-tests.sh --only dev-install,integrate-gitlab-full  # opt-in, heavy
+```
+
+The default E2E run covers: `dev-install` (a real install; critically, that a plaintext connection is REJECTED while a real TLS connection with the correct password succeeds, proving TLS enforcement actually works; `credentials --verify` against the live instance), `doctor` (deliberately drifts the admin password on the live database and confirms detection/repair), `database` (create/list/drop, including `--owner`), and `up-down` (databases/credentials/TLS enforcement survive or are idempotently recreated). `prod-ha`/`integrate-vault-full`/`integrate-gitlab-full` are opt-in only, each standing up a second real service (or, for `prod-ha`, a second postgres release).
+
 ## Repository layout
 
 ```
@@ -502,20 +655,27 @@ services/cluster/      # 'saas cluster' (alias 'saas k8s'): local kind cluster m
 services/gitlab/       # everything GitLab-specific
   gitlab.sh             # `_saas_gitlab` dispatcher (subcommands)
   lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install,
-                         # runner, token, ssh, state, credentials, doctor, vault_integration
-  values/               # dev/prod/datastore-ha/registry/pages .yaml.tpl overlays for the gitlab/gitlab chart
+                         # runner, token, ssh, state, credentials, doctor, vault_integration,
+                         # minio_integration, postgres_integration
+  values/               # dev/prod/datastore-ha/registry/pages/database-external .yaml.tpl overlays
+                         # for the gitlab/gitlab chart
 services/vault/        # everything Vault-specific (alias: 'saas openbao')
   vault.sh              # `_saas_vault` dispatcher (subcommands)
   lib/                  # state, secrets, cluster, versions, operators, tls, init, install,
                          # credentials, doctor, integration_common, gitlab_integration,
-                         # eso_integration, minio_integration
+                         # eso_integration, minio_integration, postgres_integration
   values/               # dev/prod/unseal .yaml.tpl overlays for the openbao/openbao chart, plus
-                         # standalone gitlab-*/eso-*/minio-*.yaml.tpl integration manifests
+                         # standalone gitlab-*/eso-*/minio-*/postgres-*.yaml.tpl integration manifests
 services/minio/        # everything MinIO-specific (alias: 'saas object-storage')
   minio.sh              # `_saas_minio` dispatcher (subcommands)
   lib/                  # state, cluster, backend, tls, install, credentials, doctor, bucket,
                          # integration_common, vault_integration, gitlab_integration
   values/               # standalone gitlab-datastore-secrets.yaml.tpl integration manifest
+services/postgres/     # everything PostgreSQL-specific (alias: 'saas postgresql')
+  postgres.sh           # `_saas_postgres` dispatcher (subcommands)
+  lib/                  # state, cluster, expose, tls, backend, install, credentials, doctor,
+                         # database, integration_common, vault_integration, gitlab_integration
+  values/               # standalone gitlab-datastore-psql-secret.yaml.tpl integration manifest
 tests/cluster/
   unit/                  # fast, no real cluster (mock kind/docker/kubectl)
   e2e/                    # real, spin up several disposable kind clusters
@@ -528,7 +688,10 @@ tests/vault/
 tests/minio/
   unit/                  # fast, no real cluster (mock kubectl/kind_cluster)
   e2e/                    # real, spin up a disposable kind cluster
+tests/postgres/
+  unit/                  # fast, no real cluster (mock kubectl/kind_cluster)
+  e2e/                    # real, spin up a disposable kind cluster
 tools/                  # standalone scripts, not part of 'saas' itself (e.g. extracting a Helm chart's real values.yaml)
 ```
 
-A future service (e.g. a self-hosted database) is added as `services/<name>/` following the same pattern, without touching `saas.sh` beyond one new line in its `case`.
+A future service is added as `services/<name>/` following the same pattern, without touching `saas.sh` beyond one new line in its `case`.

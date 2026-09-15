@@ -189,13 +189,21 @@ _saas_require_cluster_backend() {
     fi
 }
 
-# _saas_cluster_backend_create KIND_NAME WORKERS STORAGE_MODE NON_INTERACTIVE YES
+# _saas_cluster_backend_create KIND_NAME WORKERS STORAGE_MODE NON_INTERACTIVE YES [EXPOSE_MODE]
+# EXPOSE_MODE defaults to 'ingress-nginx' (unchanged behavior for gitlab/vault/minio, which all
+# serve an Ingress). services/postgres/ is the one caller that passes 'none' explicitly: PostgreSQL
+# is never served through an Ingress (its own wire protocol, not HTTP, see
+# services/postgres/lib/tls.sh), so reserving the host's ports 80/443 for it would be both pointless
+# and actively harmful, confirmed live: it collides with any OTHER already-running kind cluster on
+# the same host that legitimately does need those ports (gitlab/vault/minio), exactly the class of
+# same-host port collision this repo's own E2E suites already work around for cross-service tests.
 _saas_cluster_backend_create() {
     local kind_name="$1" workers="$2" storage_mode="$3" non_interactive="$4" yes="$5"
+    local expose_mode="${6:-ingress-nginx}"
     _saas_require_cluster_backend || return 1
 
     local -a args=(create --name "$kind_name" --workers "$workers" \
-        --storage-mode "$storage_mode" --expose-mode ingress-nginx)
+        --storage-mode "$storage_mode" --expose-mode "$expose_mode")
     $non_interactive && args+=(--non-interactive)
     $yes && args+=(--yes)
 
@@ -333,4 +341,32 @@ _saas_ensure_certmanager() {
     helm upgrade --install cert-manager jetstack/cert-manager \
         --namespace cert-manager --create-namespace \
         --set crds.enabled=true --wait --timeout 180s
+}
+
+# CloudNativePG operator install and PostgreSQL image, shared by services/gitlab/lib/datastore-ha.sh
+# (GitLab's own HA PostgreSQL, --mode prod) and services/postgres/lib/backend.sh (the standalone
+# service's own --mode prod): promoted here the moment a second consumer needed the exact same
+# logic/tag with zero variation, same threshold already used for the MinIO/mc image pins above.
+_SAAS_CNPG_HELM_REPO_URL="https://cloudnative-pg.github.io/charts"
+_SAAS_CNPG_CHART_VERSION="0.29.0"    # operator 1.30.0; verify with 'helm search repo cnpg/cloudnative-pg --versions' before bumping
+_SAAS_CNPG_NAMESPACE="cnpg-system"
+_SAAS_CNPG_POSTGRESQL_IMAGE="ghcr.io/cloudnative-pg/postgresql:17"
+
+# _saas_ensure_cnpg_operator
+# Idempotent: does nothing if CloudNativePG's CRDs are already installed.
+_saas_ensure_cnpg_operator() {
+    if kubectl get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
+        _saas_log_info "CloudNativePG operator is already installed."
+        return 0
+    fi
+
+    _saas_log_step "Installing the CloudNativePG operator (PostgreSQL HA)…"
+    if ! helm repo list -o json 2>/dev/null | jq -e '.[]? | select(.name == "cnpg")' >/dev/null; then
+        helm repo add cnpg "$_SAAS_CNPG_HELM_REPO_URL" >/dev/null || return 1
+    fi
+    helm repo update cnpg >/dev/null || return 1
+
+    helm upgrade --install cnpg cnpg/cloudnative-pg \
+        --namespace "$_SAAS_CNPG_NAMESPACE" --create-namespace \
+        --version "$_SAAS_CNPG_CHART_VERSION" --wait --timeout 180s
 }

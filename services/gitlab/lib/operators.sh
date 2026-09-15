@@ -10,10 +10,6 @@
 # only offers ':latest' (no version pinning) for a reduced image set, with the full catalog behind a
 # paid subscription, incompatible with pinning exact versions for reproducible builds.
 
-_SAAS_GITLAB_CNPG_HELM_REPO_URL="https://cloudnative-pg.github.io/charts"
-_SAAS_GITLAB_CNPG_CHART_VERSION="0.29.0"    # operator 1.30.0; verify with 'helm search repo cnpg/cloudnative-pg --versions' before bumping
-_SAAS_GITLAB_CNPG_NAMESPACE="cnpg-system"
-
 _SAAS_GITLAB_REDIS_OPERATOR_HELM_REPO_URL="https://ot-container-kit.github.io/helm-charts/"
 _SAAS_GITLAB_REDIS_OPERATOR_CHART_VERSION="0.26.1"    # app 0.26.0; verify with 'helm search repo ot-helm/redis-operator --versions' before bumping
 _SAAS_GITLAB_REDIS_OPERATOR_NAMESPACE="redis-operator-system"
@@ -33,23 +29,10 @@ _SAAS_GITLAB_DUCKDNS_WEBHOOK_GROUP_NAME="acme.duckdns.org"
 _SAAS_GITLAB_DUCKDNS_WEBHOOK_SOLVER_NAME="duckdns"
 
 # _saas_gitlab_operator_cnpg_ensure
-# Idempotent: does nothing if CloudNativePG's CRDs are already installed.
-_saas_gitlab_operator_cnpg_ensure() {
-    if kubectl get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
-        _saas_log_info "CloudNativePG operator is already installed."
-        return 0
-    fi
-
-    _saas_log_step "Installing the CloudNativePG operator (PostgreSQL HA)…"
-    if ! helm repo list -o json 2>/dev/null | jq -e '.[]? | select(.name == "cnpg")' >/dev/null; then
-        helm repo add cnpg "$_SAAS_GITLAB_CNPG_HELM_REPO_URL" >/dev/null || return 1
-    fi
-    helm repo update cnpg >/dev/null || return 1
-
-    helm upgrade --install cnpg cnpg/cloudnative-pg \
-        --namespace "$_SAAS_GITLAB_CNPG_NAMESPACE" --create-namespace \
-        --version "$_SAAS_GITLAB_CNPG_CHART_VERSION" --wait --timeout 180s
-}
+# One-line wrapper around the shared _saas_ensure_cnpg_operator (lib/common.sh): promoted there the
+# moment services/postgres/ needed the exact same install logic with zero variation, same "rule of
+# three" precedent already documented in CLAUDE.md for _saas_ensure_certmanager/_saas_cluster_backend_*.
+_saas_gitlab_operator_cnpg_ensure() { _saas_ensure_cnpg_operator; }
 
 # _saas_gitlab_operator_redis_ensure
 # Idempotent: does nothing if OT-CONTAINER-KIT's redis-operator CRDs are already installed.

@@ -117,14 +117,19 @@ EOF
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null || return 1
 }
 
-# _saas_gitlab_datastore_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+# _saas_gitlab_datastore_apply NAMESPACE RELEASE STORAGE_CLASS OBJECT_STORAGE_MODE DATABASE_MODE PSQL_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD
 # --mode dev only (see datastore-ha.sh for --mode prod). OBJECT_STORAGE_MODE: 'internal' (default,
 # unchanged behavior) deploys this release's own private MinIO, same as before this parameter
 # existed; 'external' skips it entirely, relying on Secrets 'saas gitlab integrate minio' already
 # applied (see install.sh, which refuses to proceed with 'external' if they're missing).
+# DATABASE_MODE: same shape, independent of OBJECT_STORAGE_MODE: 'internal' (default) deploys this
+# release's own private PostgreSQL, same as before this parameter existed; 'external' skips it
+# entirely (no Secret, no StatefulSet/ConfigMap/Service), relying on the Secret 'saas gitlab
+# integrate postgres' already applied (see install.sh, which refuses to proceed with 'external' if
+# it's missing). Redis is never affected by either flag, always deployed internally here.
 _saas_gitlab_datastore_apply() {
-    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4"
-    local psql_password="$5" minio_user="$6" minio_password="$7"
+    local ns="$1" release="$2" storage_class="$3" object_storage_mode="$4" database_mode="$5"
+    local psql_password="$6" minio_user="$7" minio_password="$8"
 
     local psql_storage="2Gi"
     local psql_cpu="200m" psql_mem="512Mi" redis_cpu="50m" redis_mem="128Mi"
@@ -139,12 +144,14 @@ _saas_gitlab_datastore_apply() {
     local sc_field_sts=""
     [ -n "$storage_class" ] && sc_field_sts="        storageClassName: ${storage_class}"
 
-    _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
     if [ "$object_storage_mode" = "internal" ]; then
         _saas_gitlab_datastore_minio_secrets_apply "$ns" "$release" "$minio_user" "$minio_password" || return 1
     fi
 
-    kubectl apply -n "$ns" -f - <<EOF || return 1
+    if [ "$database_mode" = "internal" ]; then
+        _saas_gitlab_datastore_psql_secret_apply "$ns" "$release" "$psql_password" || return 1
+
+        kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -208,7 +215,12 @@ metadata:
 spec:
   selector: {app: ${release}-postgresql}
   ports: [{port: 5432, targetPort: 5432}]
----
+EOF
+    else
+        _saas_log_info "Database: external (managed by 'saas postgres'), no private PostgreSQL deployed here."
+    fi
+
+    kubectl apply -n "$ns" -f - <<EOF || return 1
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -243,7 +255,9 @@ spec:
 EOF
 
     _saas_log_wait "Waiting for PostgreSQL/Redis to be ready…"
-    kubectl -n "$ns" rollout status statefulset "${release}-postgresql" --timeout=180s || return 1
+    if [ "$database_mode" = "internal" ]; then
+        kubectl -n "$ns" rollout status statefulset "${release}-postgresql" --timeout=180s || return 1
+    fi
     kubectl -n "$ns" rollout status deployment "${release}-redis" --timeout=120s || return 1
 
     if [ "$object_storage_mode" = "internal" ]; then
