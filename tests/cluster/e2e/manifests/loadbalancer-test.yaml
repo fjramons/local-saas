@@ -1,0 +1,36 @@
+# Deployment + LoadBalancer Service used by tests/cluster/e2e/run-tests.sh to
+# confirm MetalLB assigns an EXTERNAL-IP and that the IP range doesn't
+# collide between clusters. Reusable by hand:
+#   kubectl --context kind-<name> apply -f loadbalancer-test.yaml
+#   kubectl --context kind-<name> get svc web
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: LoadBalancer
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80

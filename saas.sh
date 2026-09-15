@@ -13,6 +13,8 @@ _SAAS_ROOT_DIR="$(_saas_root_dir)"
 
 # shellcheck source=lib/common.sh
 source "$_SAAS_ROOT_DIR/lib/common.sh"
+# shellcheck source=services/cluster/cluster.sh
+source "$_SAAS_ROOT_DIR/services/cluster/cluster.sh"
 # shellcheck source=services/gitlab/gitlab.sh
 source "$_SAAS_ROOT_DIR/services/gitlab/gitlab.sh"
 # shellcheck source=services/vault/vault.sh
@@ -28,12 +30,16 @@ Single entry point to install and manage self-hosted SaaS services on
 Kubernetes.
 
 Available services:
+  cluster   Local Kubernetes clusters via kind (alias: k8s), see
+            'saas cluster --help'
   gitlab    Self-hosted GitLab (official Helm chart), see 'saas gitlab --help'
   vault     Self-hosted OpenBao (alias: openbao), see 'saas vault --help'
   minio     Standalone S3-compatible object storage (alias: object-storage),
             see 'saas minio --help'
 
 Examples:
+  saas cluster create
+  saas cluster --help
   saas gitlab install
   saas gitlab --help
   saas gitlab install --help
@@ -49,6 +55,9 @@ saas() {
     [ $# -gt 0 ] && shift
 
     case "$service" in
+        cluster|k8s)
+            _saas_cluster "$@"
+            ;;
         gitlab)
             _saas_gitlab "$@"
             ;;

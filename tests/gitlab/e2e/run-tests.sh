@@ -6,17 +6,21 @@
 # fail". Same pattern (pass/fail, --only PHASE, --keep, cleanup trap) as
 # tests/kind-cluster/run-tests.sh in the sibling bash-aliases repo.
 #
-# Requires 'kind_cluster' to be loaded in the shell (bash-aliases) and
-# saas gitlab's dependencies: kind, docker, kubectl, helm, jq, envsubst,
-# curl. Takes several minutes (installs GitLab for real).
+# By default, manages its own kind cluster via this repo's own 'saas
+# cluster' (self-contained, no external dependency beyond saas gitlab's
+# own: kind, docker, kubectl, helm, jq, envsubst, curl). Takes several
+# minutes (installs GitLab for real).
 #
-# 'bash tests/gitlab/e2e/run-tests.sh' starts a NON-interactive bash,
-# which doesn't inherit functions sourced in your shell (even if
-# kind_cluster is already loaded where you launch it from), to avoid
-# hardcoding any PC's absolute path in this file, if 'kind_cluster' isn't
-# already available the KIND_CLUSTER_FUNCTIONS environment variable
-# (path to bash-aliases' local-cluster-functions.sh) is used to load it:
-#   KIND_CLUSTER_FUNCTIONS=/path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh \
+# Set USE_KIND_CLUSTER_FUNCTION=true to exercise the legacy 'kind_cluster'
+# function instead (bash-aliases repo). 'bash tests/gitlab/e2e/run-tests.sh'
+# starts a NON-interactive bash, which doesn't inherit functions sourced in
+# your shell (even if kind_cluster is already loaded where you launch it
+# from), so in that mode, if 'kind_cluster' isn't already available, the
+# KIND_CLUSTER_FUNCTIONS environment variable (path to bash-aliases'
+# local-cluster-functions.sh) is used to load it, to avoid hardcoding any
+# PC's absolute path in this file:
+#   USE_KIND_CLUSTER_FUNCTION=true \
+#     KIND_CLUSTER_FUNCTIONS=/path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh \
 #     bash tests/gitlab/e2e/run-tests.sh
 set -uo pipefail
 
@@ -121,15 +125,17 @@ puts p.full_path
     kubectl -n "$ns" exec "$toolbox_pod" -- gitlab-rails runner "$script" 2>/dev/null | grep -qx "root/e2e-smoke"
 }
 
-if ! command -v kind_cluster >/dev/null 2>&1 && [ -n "${KIND_CLUSTER_FUNCTIONS:-}" ]; then
-    # shellcheck disable=SC1090
-    source "$KIND_CLUSTER_FUNCTIONS"
+if [ "${USE_KIND_CLUSTER_FUNCTION:-false}" = "true" ]; then
+    if ! command -v kind_cluster >/dev/null 2>&1 && [ -n "${KIND_CLUSTER_FUNCTIONS:-}" ]; then
+        # shellcheck disable=SC1090
+        source "$KIND_CLUSTER_FUNCTIONS"
+    fi
+    command -v kind_cluster >/dev/null 2>&1 || {
+        echo "❌ USE_KIND_CLUSTER_FUNCTION=true, but 'kind_cluster' is not available. Load it in your shell before this script, or pass" >&2
+        echo "   KIND_CLUSTER_FUNCTIONS=/path/to/local-cluster-functions.sh bash tests/gitlab/e2e/run-tests.sh" >&2
+        exit 1
+    }
 fi
-command -v kind_cluster >/dev/null 2>&1 || {
-    echo "❌ 'kind_cluster' is not available. Load it in your shell before this script, or pass" >&2
-    echo "   KIND_CLUSTER_FUNCTIONS=/path/to/local-cluster-functions.sh bash tests/gitlab/e2e/run-tests.sh" >&2
-    exit 1
-}
 
 source "$REPO_ROOT/saas.sh"
 

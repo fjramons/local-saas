@@ -1,22 +1,68 @@
 # Self-Hosted SaaS Toolkit
 
-Bash scripts to install and manage self-hosted SaaS services on Kubernetes. The entry point is the `saas` function, which dispatches to a service (`saas gitlab ...`, `saas vault ...`, `saas minio ...`) and that service to its own subcommands. Three services exist today, GitLab, Vault (self-hosted OpenBao), and MinIO (standalone S3-compatible object storage), but the layout is designed to add more (`saas postgres ...`, etc.) without touching what's already built.
+Bash scripts to install and manage self-hosted SaaS services on Kubernetes. The entry point is the `saas` function, which dispatches to a service (`saas gitlab ...`, `saas vault ...`, `saas minio ...`) and that service to its own subcommands. Three services exist today, GitLab, Vault (self-hosted OpenBao), and MinIO (standalone S3-compatible object storage), but the layout is designed to add more (`saas postgres ...`, etc.) without touching what's already built. A fourth subcommand, `saas cluster` (alias `saas k8s`), manages the local `kind` clusters those services run on; see "Cluster management" below.
 
 ## Setup
 
 Add this to your shell profile (`~/.bashrc`, `~/.bash_aliases`, etc.) so `saas` is available in every new shell:
 
 ```bash
-# kind_cluster (sibling repo bash-aliases): only needed for --cluster-mode kind
-source /path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh
-# this repo
 source /path/to/local-saas/saas.sh
 ```
 
-You need `kind`, `docker`, `kubectl`, `helm`, `jq`, `envsubst`, `curl` on your `PATH`. `saas gitlab install` reports clearly if any is missing.
+That's it: this repo is self-contained, including its own `saas cluster` for managing local `kind` clusters (no external dependency). You need `kind`, `docker`, `kubectl`, `helm`, `jq`, `envsubst`, `curl` on your `PATH`. `saas gitlab install` reports clearly if any is missing.
 
 ```bash
 saas --help
+```
+
+Setting `USE_KIND_CLUSTER_FUNCTION=true` switches `saas gitlab|vault|minio`'s `--cluster-mode kind` back to the legacy `kind_cluster` function instead (maintained separately, in the sibling `bash-aliases` repo), for a transition period; see "Cluster management" below for when that's needed.
+
+## Cluster management (saas cluster)
+
+Manages local Kubernetes clusters with `kind`: multiple simultaneous clusters, `LoadBalancer` Services (MetalLB), persistent storage that works across several nodes (`local-path` or `nfs`), optional ingress-nginx/Gateway API, and selective publishing of specific services on the LAN. Also usable as `saas k8s ...`, a pure alias. `saas gitlab|vault|minio` use this by default for `--cluster-mode kind`; you don't need to run it directly for those, unless you want a cluster to exist before installing anything, or want the lower-level operations (`list`, `status`, `expose`, ...) directly.
+
+```bash
+saas cluster create                                    # asks the essentials, sensible defaults
+saas cluster create --name demo --workers 2 --yes       # unattended, no prompts
+saas cluster list                                       # every kind cluster on this host
+saas cluster status demo
+saas cluster use demo                                   # switch the active kubectl context
+saas cluster delete demo --purge-storage -y
+```
+
+Publish a specific `Service` on the LAN (not just the host), without recreating the cluster:
+
+```bash
+saas cluster expose add demo --service my-service --host-port 8080
+saas cluster expose list demo
+saas cluster expose remove demo --host-port 8080
+```
+
+`create`'s `--provider kind` flag defaults to `kind` (today's only implemented provider, so it never needs to be passed) and is the reserved extension point for a future remote/non-kind provider; see CLAUDE.md's Design notes for how that's meant to be added later without complicating today's command.
+
+### Contextual help
+
+```bash
+saas cluster --help
+saas cluster create --help
+saas cluster expose --help
+```
+
+### Tests
+
+```bash
+bash tests/cluster/unit/test-argparse-values.sh          # under 1s, no real cluster
+bash tests/cluster/e2e/run-tests.sh                       # real, several disposable kind clusters, several minutes
+bash tests/cluster/e2e/run-tests.sh --only expose         # a single phase
+```
+
+### Coexisting with the legacy `kind_cluster` function
+
+`saas cluster` (v1.0) is a self-contained, faithful port of `kind_cluster`, a bash function maintained separately in the sibling `bash-aliases` repo that this project used to depend on directly. Both manage the exact same kind of real `kind` cluster, with no separate inventory of their own, so `saas cluster list/status/use/delete` already shows and manages clusters created by either tool, and `saas cluster expose` publications are visible to and manageable by both (deliberately: `expose`'s docker labels use the same namespace as the legacy function's). Setting `USE_KIND_CLUSTER_FUNCTION=true` makes `saas gitlab|vault|minio` fall back to calling the legacy `kind_cluster` function instead of this repo's own `saas cluster`, for a transition period; that still needs `kind_cluster` loaded separately:
+
+```bash
+USE_KIND_CLUSTER_FUNCTION=true saas gitlab install   # uses the legacy kind_cluster function
 ```
 
 ## GitLab
@@ -445,8 +491,14 @@ The default E2E run covers: `dev-install` (a real install, a real bucket create/
 
 ```
 saas.sh              # public dispatcher `saas SERVICE SUBCOMMAND ...`
-lib/common.sh         # shared helpers (logging, prompts, getopt, kind_cluster guard,
-                       # cert-manager ensure, StorageClass resolution - shared by every service)
+lib/common.sh         # shared helpers (logging, prompts, getopt, cluster backend selection
+                       # (_saas_cluster_backend_*, USE_KIND_CLUSTER_FUNCTION), cert-manager
+                       # ensure, StorageClass resolution - shared by every service)
+services/cluster/      # 'saas cluster' (alias 'saas k8s'): local kind cluster management,
+                       # a self-contained v1.0 port of the legacy kind_cluster function
+  cluster.sh            # `_saas_cluster` dispatcher (subcommands)
+  lib/                  # create, delete, list, status, use, loadbalancer, kubeconfig, expose,
+                         # metallb, ingress, storage, render, network, target, validators, deps
 services/gitlab/       # everything GitLab-specific
   gitlab.sh             # `_saas_gitlab` dispatcher (subcommands)
   lib/                  # cluster, versions, operators, tls, datastore, datastore-ha, install,
@@ -464,6 +516,9 @@ services/minio/        # everything MinIO-specific (alias: 'saas object-storage'
   lib/                  # state, cluster, backend, tls, install, credentials, doctor, bucket,
                          # integration_common, vault_integration, gitlab_integration
   values/               # standalone gitlab-datastore-secrets.yaml.tpl integration manifest
+tests/cluster/
+  unit/                  # fast, no real cluster (mock kind/docker/kubectl)
+  e2e/                    # real, spin up several disposable kind clusters
 tests/gitlab/
   unit/                  # fast, no real cluster (mock kubectl/helm/kind_cluster)
   e2e/                    # real, spin up a disposable kind cluster

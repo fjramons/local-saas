@@ -1,6 +1,6 @@
 ---
 name: test-saas-vault
-description: Re-runs the saas vault tests (unit + real E2E) after modifying any file under services/vault/, services/gitlab/lib/vault_integration.sh, services/minio/lib/vault_integration.sh, or lib/common.sh. Use whenever state.sh, secrets.sh, cluster.sh, versions.sh, operators.sh, tls.sh, init.sh, install.sh, credentials.sh, doctor.sh, integration_common.sh, gitlab_integration.sh, eso_integration.sh, minio_integration.sh, vault_integration.sh, or values/*.yaml.tpl change.
+description: Re-runs the saas vault tests (unit + real E2E) after modifying any file under services/vault/, services/gitlab/lib/vault_integration.sh, services/minio/lib/vault_integration.sh, services/cluster/, or lib/common.sh. Use whenever state.sh, secrets.sh, cluster.sh, versions.sh, operators.sh, tls.sh, init.sh, install.sh, credentials.sh, doctor.sh, integration_common.sh, gitlab_integration.sh, eso_integration.sh, minio_integration.sh, vault_integration.sh, values/*.yaml.tpl, or the shared _saas_cluster_backend_* functions (lib/common.sh) change. See also .claude/skills/test-saas-cluster.
 ---
 
 # Testing `saas vault`

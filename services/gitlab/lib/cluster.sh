@@ -1,46 +1,11 @@
-# --- Management of the underlying cluster for 'saas gitlab': either a kind cluster created/managed by us (via the kind_cluster function, which must already be loaded in the user's shell), or an existing cluster the active kubeconfig already points at.
+# --- Management of the underlying cluster for 'saas gitlab': either a kind cluster created/managed by us (via 'saas cluster', or the legacy 'kind_cluster' function if USE_KIND_CLUSTER_FUNCTION=true, see the shared _saas_cluster_backend_* in lib/common.sh), or an existing cluster the active kubeconfig already points at.
 
 _saas_gitlab_valid_cluster_mode() { [[ "$1" == "kind" || "$1" == "existing" ]]; }
 
-# _saas_gitlab_cluster_create KIND_NAME WORKERS STORAGE_MODE NON_INTERACTIVE YES
-_saas_gitlab_cluster_create() {
-    local kind_name="$1" workers="$2" storage_mode="$3" non_interactive="$4" yes="$5"
-    _saas_require_kind_cluster_fn || return 1
-
-    local -a args=(create --name "$kind_name" --workers "$workers" \
-        --storage-mode "$storage_mode" --expose-mode ingress-nginx)
-    $non_interactive && args+=(--non-interactive)
-    $yes && args+=(--yes)
-
-    _saas_log_step "Creating kind cluster '$kind_name' (workers=$workers, storage-mode=$storage_mode)…"
-    kind_cluster "${args[@]}"
-}
-
-# _saas_gitlab_cluster_delete KIND_NAME PURGE_STORAGE
-_saas_gitlab_cluster_delete() {
-    local kind_name="$1" purge="$2"
-    _saas_require_kind_cluster_fn || return 1
-
-    local -a args=(delete "$kind_name" --yes)
-    $purge && args+=(--purge-storage)
-
-    _saas_log_step "Deleting kind cluster '$kind_name'$($purge && echo ' (with --purge-storage)')…"
-    kind_cluster "${args[@]}"
-}
-
-# _saas_gitlab_cluster_use KIND_NAME
-# Points kubectl at the given kind cluster's context.
-_saas_gitlab_cluster_use() {
-    local kind_name="$1"
-    _saas_require_kind_cluster_fn || return 1
-    kind_cluster use "$kind_name" >/dev/null
-}
-
-_saas_gitlab_cluster_exists() {
-    local kind_name="$1"
-    _saas_require_kind_cluster_fn || return 1
-    kind get clusters -q 2>/dev/null | grep -qx "$kind_name"
-}
+_saas_gitlab_cluster_create() { _saas_cluster_backend_create "$@"; }
+_saas_gitlab_cluster_delete() { _saas_cluster_backend_delete "$@"; }
+_saas_gitlab_cluster_use()    { _saas_cluster_backend_use "$@"; }
+_saas_gitlab_cluster_exists() { _saas_cluster_backend_exists "$@"; }
 
 # _saas_gitlab_cluster_patch_coredns DOMAIN [EXTRA_DOMAIN...]
 # --cluster-mode kind only. A domain like '<release>.gitlab.local' (or even a real public domain whose DNS points at an IP the cluster can't reach itself on) does not resolve from INSIDE the cluster. Verified in practice: without this, both the runner registration and, above all, the 'git clone' each CI job does inside its own pod fail with "Could not resolve host", because GitLab always uses the configured public domain (global.hosts.domain) as CI_SERVER_URL, never an alternate internal URL. EXTRA_DOMAIN entries (e.g. registry.<domain>, pages.<domain>, when those features are enabled) need the same treatment: they resolve to the same ingress, just a different Host header.
@@ -165,7 +130,9 @@ _saas_gitlab_cluster_patch_coredns_pages_wildcard() {
     kubectl -n kube-system rollout status deployment coredns --timeout=60s >/dev/null
 }
 
-# _saas_gitlab_require_kind_cluster_fn and _saas_gitlab_resolve_storage_class used to live here.
-# Both had zero gitlab-specific variation, so once openbao needed the exact same logic they were
-# promoted to lib/common.sh as _saas_require_kind_cluster_fn / _saas_resolve_storage_class (see
-# CLAUDE.md's Design notes); this file now just calls those shared functions.
+# _saas_gitlab_resolve_storage_class used to live here; it had zero gitlab-specific variation, so
+# once openbao needed the exact same logic it was promoted to lib/common.sh as
+# _saas_resolve_storage_class (see CLAUDE.md's Design notes). The create/delete/use/exists
+# wrappers above went through the same promotion once 'saas cluster' (v1.0) replaced kind_cluster
+# as the default backend and vault/minio needed the exact same USE_KIND_CLUSTER_FUNCTION-gated
+# logic: they're now thin calls to the shared _saas_cluster_backend_* functions in lib/common.sh.

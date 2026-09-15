@@ -159,7 +159,9 @@ _saas_gitlab_doctor_fix_minio() {
 
 # _saas_gitlab_doctor_check_expose KIND_NAME HOST_PORT
 # True if a running container is currently publishing HOST_PORT for KIND_NAME (same
-# 'kind-cluster.expose.*' labels _kind_cluster_expose_add itself uses to detect a duplicate).
+# 'kind-cluster.expose.*' labels the cluster backend's own 'expose add' uses to detect a
+# duplicate, whether that's 'saas cluster' or the legacy 'kind_cluster' function - both use the
+# same label namespace on purpose, see CLAUDE.md's Design notes).
 _saas_gitlab_doctor_check_expose() {
     local kind_name="$1" host_port="$2"
     docker ps --filter "label=kind-cluster.expose.cluster=${kind_name}" \

@@ -1,0 +1,55 @@
+# Deployment + ClusterIP Service + HTTPRoute used by tests/cluster/e2e/run-tests.sh
+# to test --expose-mode gateway-api: Envoy Gateway's proxy listens on the
+# control-plane node's fixed NodePort 30080/30443 (mapped by 'saas cluster
+# create' to the host's own 80/443), and the host is curled with a Host header
+# to confirm traffic genuinely reaches the pod through the HTTPRoute. The
+# parentRef "sce2e-gateway-gw" is tied to the test cluster's fixed name
+# (CLUSTER_G in run-tests.sh: sce2e-gateway) - the Gateway is created
+# automatically by 'saas cluster create --expose-mode gateway-api' under the
+# name "<cluster>-gw". Only reusable by hand as-is if the cluster is named
+# "sce2e-gateway"; with another name, adjust the parentRef's "name" field.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+spec:
+  parentRefs:
+    - name: sce2e-gateway-gw
+  hostnames:
+    - test.local
+  rules:
+    - backendRefs:
+        - name: web
+          port: 80

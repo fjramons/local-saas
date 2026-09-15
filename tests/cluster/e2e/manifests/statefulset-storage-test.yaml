@@ -1,0 +1,46 @@
+# StatefulSet + PVC used by tests/cluster/e2e/run-tests.sh to test multi-node
+# persistent storage (the local-path+extraMounts fix, or the nfs-csi
+# StorageClass). On startup it writes a marker with its own hostname+timestamp
+# to /data, ONLY IF IT DOESN'T ALREADY EXIST; after cordoning its node and
+# deleting the pod, the test checks which node it gets rescheduled onto. The
+# "only if missing" part is what lets the test tell real persisted data apart
+# from a fresh, empty volume: if the storage fix were broken and a new volume
+# got provisioned after rescheduling, the marker would carry a different value
+# (same StatefulSet hostname, but a new timestamp) - an unconditional write
+# would make both cases indistinguishable, giving a false positive for
+# persistence.
+# Reusable by hand:
+#   kubectl --context kind-<name> apply -f statefulset-storage-test.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: writer
+spec:
+  serviceName: writer
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer
+  template:
+    metadata:
+      labels:
+        app: writer
+    spec:
+      containers:
+        - name: writer
+          image: busybox
+          command:
+            - sh
+            - -c
+            - "[ -f /data/marker ] || echo $(hostname)-$(date +%s) > /data/marker; sleep 3600"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

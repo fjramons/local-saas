@@ -44,8 +44,10 @@ Options:
       --kind-workers N         Number of worker nodes in the kind cluster
                                 (kind only; default: 0)
       --storage-mode MODE      local-path (default) or nfs; only with
-                                --cluster-mode kind, passed through to
-                                kind_cluster
+                                --cluster-mode kind, passed through to the
+                                cluster backend ('saas cluster', or the
+                                legacy kind_cluster function if
+                                USE_KIND_CLUSTER_FUNCTION=true)
       --storage-class NAME     StorageClass to use; only with
                                 --cluster-mode existing (default: the
                                 cluster's default StorageClass is

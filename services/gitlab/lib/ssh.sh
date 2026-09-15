@@ -1,18 +1,17 @@
-# --- SSH de GitLab expuesto desde un cluster kind sin tocar el puerto 22 real del host: reutiliza 'kind_cluster expose add' (proxy socat en un contenedor Docker aparte, mecanismo ya existente en bash-aliases) para mapear el puerto 22 del Service gitlab-shell a un puerto alto del host (por defecto 2222).
+# --- GitLab's SSH exposed from a kind cluster without touching the host's real port 22: reuses the cluster backend's own 'expose add' (a socat proxy in a separate Docker container, see lib/common.sh's _saas_cluster_backend_expose_*) to map the gitlab-shell Service's port 22 to a high host port (2222 by default).
 
 # _saas_gitlab_ssh_expose KIND_NAME NAMESPACE RELEASE HOST_PORT
 _saas_gitlab_ssh_expose() {
     local kind_name="$1" ns="$2" release="$3" host_port="$4"
-    _saas_require_kind_cluster_fn || return 1
 
     local svc="${release}-gitlab-shell"
     local ip
     ip="$(kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)"
     [ -n "$ip" ] || { _saas_log_err "Could not find the Service '$svc' in namespace '$ns'."; return 1; }
 
-    kind_cluster expose remove "$kind_name" --host-port "$host_port" --protocol tcp >/dev/null 2>&1
+    _saas_cluster_backend_expose_remove "$kind_name" --host-port "$host_port" --protocol tcp >/dev/null 2>&1
 
-    kind_cluster expose add "$kind_name" --target "${ip}:22" --host-port "$host_port" --protocol tcp
+    _saas_cluster_backend_expose_add "$kind_name" --target "${ip}:22" --host-port "$host_port" --protocol tcp
 }
 
 _saas_gitlab_ssh_config_help() {

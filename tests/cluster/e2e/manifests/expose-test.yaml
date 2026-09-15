@@ -1,0 +1,51 @@
+# Deployment + two Services (LoadBalancer and ClusterIP) used by
+# tests/cluster/e2e/run-tests.sh to test 'saas cluster expose add|list|remove'.
+# The ClusterIP Service is what actually exercises the proxy's route-to-the-
+# Service-CIDR mechanism (see CLAUDE.md's Design notes): a LoadBalancer IP is
+# already reachable from the 'kind' docker network with no fix at all, so
+# testing only that path would prove nothing new.
+# Reusable by hand:
+#   kubectl --context kind-<name> apply -f expose-test.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+spec:
+  type: LoadBalancer
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-clusterip
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80

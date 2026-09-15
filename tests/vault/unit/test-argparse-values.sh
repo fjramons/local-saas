@@ -16,8 +16,10 @@ declare -a RESULTS=()
 pass() { RESULTS+=("PASS: $1"); echo "✅ PASS: $1"; }
 fail() { RESULTS+=("FAIL: $1"); echo "❌ FAIL: $1"; }
 
-# kind_cluster isn't needed for these tests (no real cluster is touched), but the shared
-# _saas_require_kind_cluster_fn (lib/common.sh) only checks 'command -v kind_cluster'.
+# kind_cluster isn't needed for these tests (no real cluster is touched); forcing the legacy
+# backend (USE_KIND_CLUSTER_FUNCTION=true) and providing an empty 'kind_cluster' is simpler to
+# mock than the default 'saas cluster' backend, which would try to create a real cluster.
+export USE_KIND_CLUSTER_FUNCTION=true
 kind_cluster() { :; }
 
 source "$REPO_ROOT/lib/common.sh"

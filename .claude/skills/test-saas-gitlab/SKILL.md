@@ -1,6 +1,6 @@
 ---
 name: test-saas-gitlab
-description: Re-runs the saas gitlab tests (unit + real E2E) after modifying any file under services/gitlab/ or lib/common.sh. Use whenever install.sh, datastore.sh, datastore-ha.sh, operators.sh, tls.sh, runner.sh, token.sh, doctor.sh, cluster.sh, ssh.sh, state.sh, minio_integration.sh, or values/*.yaml.tpl change.
+description: Re-runs the saas gitlab tests (unit + real E2E) after modifying any file under services/gitlab/, services/cluster/, or lib/common.sh. Use whenever install.sh, datastore.sh, datastore-ha.sh, operators.sh, tls.sh, runner.sh, token.sh, doctor.sh, cluster.sh, ssh.sh, state.sh, minio_integration.sh, values/*.yaml.tpl, or the shared _saas_cluster_backend_* functions (lib/common.sh) change. See also .claude/skills/test-saas-cluster.
 ---
 
 # Testing `saas gitlab`

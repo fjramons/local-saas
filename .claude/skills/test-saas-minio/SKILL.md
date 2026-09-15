@@ -1,6 +1,6 @@
 ---
 name: test-saas-minio
-description: Re-runs the saas minio tests (unit + real E2E) after modifying any file under services/minio/, services/gitlab/lib/minio_integration.sh, services/vault/lib/minio_integration.sh, or lib/common.sh. Use whenever state.sh, cluster.sh, backend.sh, tls.sh, install.sh, credentials.sh, doctor.sh, bucket.sh, integration_common.sh, vault_integration.sh, gitlab_integration.sh, or values/*.yaml.tpl change.
+description: Re-runs the saas minio tests (unit + real E2E) after modifying any file under services/minio/, services/gitlab/lib/minio_integration.sh, services/vault/lib/minio_integration.sh, services/cluster/, or lib/common.sh. Use whenever state.sh, cluster.sh, backend.sh, tls.sh, install.sh, credentials.sh, doctor.sh, bucket.sh, integration_common.sh, vault_integration.sh, gitlab_integration.sh, values/*.yaml.tpl, or the shared _saas_cluster_backend_* functions (lib/common.sh) change. See also .claude/skills/test-saas-cluster.
 ---
 
 # Testing `saas minio`

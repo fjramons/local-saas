@@ -4,14 +4,18 @@
 # commands "don't fail". Same pattern (pass/fail, --only PHASE, --keep, cleanup trap) as
 # tests/gitlab/e2e/run-tests.sh and tests/vault/e2e/run-tests.sh.
 #
-# Requires 'kind_cluster' to be loaded in the shell (bash-aliases) and saas minio's
-# dependencies: kind, docker, kubectl, helm, jq, envsubst. Takes several minutes.
+# By default, manages its own kind cluster via this repo's own 'saas cluster' (self-contained,
+# no external dependency beyond saas minio's own: kind, docker, kubectl, helm, jq, envsubst).
+# Takes several minutes.
 #
-# 'bash tests/minio/e2e/run-tests.sh' starts a NON-interactive bash, which doesn't inherit
-# functions sourced in your shell, to avoid hardcoding any PC's absolute path in this file; if
-# 'kind_cluster' isn't already available the KIND_CLUSTER_FUNCTIONS environment variable (path to
-# bash-aliases' local-cluster-functions.sh) is used to load it:
-#   KIND_CLUSTER_FUNCTIONS=/path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh \
+# Set USE_KIND_CLUSTER_FUNCTION=true to exercise the legacy 'kind_cluster' function instead
+# (bash-aliases repo). 'bash tests/minio/e2e/run-tests.sh' starts a NON-interactive bash, which
+# doesn't inherit functions sourced in your shell, so in that mode, if 'kind_cluster' isn't
+# already available the KIND_CLUSTER_FUNCTIONS environment variable (path to bash-aliases'
+# local-cluster-functions.sh) is used to load it, to avoid hardcoding any PC's absolute path in
+# this file:
+#   USE_KIND_CLUSTER_FUNCTION=true \
+#     KIND_CLUSTER_FUNCTIONS=/path/to/bash-aliases/.bash_aliases.d/local-cluster-functions.sh \
 #     bash tests/minio/e2e/run-tests.sh
 #
 # Default phases (fast-ish, run every time): dev-install, doctor, up-down. Opt-in ONLY phases
@@ -62,15 +66,17 @@ declare -a RESULTS=()
 pass() { RESULTS+=("PASS: $1"); echo "✅ PASS: $1"; }
 fail() { RESULTS+=("FAIL: $1"); echo "❌ FAIL: $1"; }
 
-if ! command -v kind_cluster >/dev/null 2>&1 && [ -n "${KIND_CLUSTER_FUNCTIONS:-}" ]; then
-    # shellcheck disable=SC1090
-    source "$KIND_CLUSTER_FUNCTIONS"
+if [ "${USE_KIND_CLUSTER_FUNCTION:-false}" = "true" ]; then
+    if ! command -v kind_cluster >/dev/null 2>&1 && [ -n "${KIND_CLUSTER_FUNCTIONS:-}" ]; then
+        # shellcheck disable=SC1090
+        source "$KIND_CLUSTER_FUNCTIONS"
+    fi
+    command -v kind_cluster >/dev/null 2>&1 || {
+        echo "❌ USE_KIND_CLUSTER_FUNCTION=true, but 'kind_cluster' is not available. Load it in your shell before this script, or pass" >&2
+        echo "   KIND_CLUSTER_FUNCTIONS=/path/to/local-cluster-functions.sh bash tests/minio/e2e/run-tests.sh" >&2
+        exit 1
+    }
 fi
-command -v kind_cluster >/dev/null 2>&1 || {
-    echo "❌ 'kind_cluster' is not available. Load it in your shell before this script, or pass" >&2
-    echo "   KIND_CLUSTER_FUNCTIONS=/path/to/local-cluster-functions.sh bash tests/minio/e2e/run-tests.sh" >&2
-    exit 1
-}
 
 source "$REPO_ROOT/saas.sh"
 
